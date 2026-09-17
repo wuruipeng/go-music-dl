@@ -216,7 +216,7 @@ cargo build --release
 
 # Windows 平台
 # 生成 MSI 安装包
-cargo wix --package go-music-dl-desktop
+cargo wix --package music-dl-desktop-rust
 
 # macOS 平台
 # 生成 DMG

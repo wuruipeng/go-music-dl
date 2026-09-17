@@ -1,13 +1,11 @@
 [package]
-name = "go-music-dl-desktop"
+name = "music-dl-desktop-rust"
 version = "0.1.0"
 edition = "2021"
-# --- 必须添加以下字段才能打包 Linux ---
 license = "AGPL-3.0"
 description = "A desktop GUI for music-dl"
 authors = ["guohuiyuan"]
 repository = "https://github.com/guohuiyuan/go-music-dl"
-# --------------------------------------
 
 [dependencies]
 tao = "0.30"
@@ -18,9 +16,6 @@ open = "3"
 [build-dependencies]
 winres = "0.1"
 
-# =========================================================
-# 1. DEB 打包配置 (Ubuntu/Debian)
-# =========================================================
 [package.metadata.deb]
 maintainer = "guohuiyuan"
 copyright = "2026, guohuiyuan"
@@ -28,20 +23,14 @@ depends = "$auto"
 section = "utility"
 priority = "optional"
 assets = [
-    # 1. 二进制文件
-    ["target/release/go-music-dl-desktop", "usr/bin/music-dl-desktop", "755"],
-    # 2. 图标文件
-    ["icon.png", "usr/share/icons/hicolor/256x256/apps/music-dl.png", "644"],
-    # 3. 桌面快捷方式 (引用刚才创建的文件)
-    ["music-dl.desktop", "usr/share/applications/music-dl.desktop", "644"],
+    ["target/release/music-dl-desktop-rust", "usr/bin/music-dl-desktop-rust", "755"],
+    ["icon.png", "usr/share/icons/hicolor/256x256/apps/music-dl-desktop-rust.png", "644"],
+    ["music-dl.desktop", "usr/share/applications/music-dl-desktop-rust.desktop", "644"],
 ]
 
-# =========================================================
-# 2. RPM 打包配置 (Fedora/CentOS)
-# =========================================================
 [package.metadata.generate-rpm]
 assets = [
-    { source = "target/release/go-music-dl-desktop", dest = "/usr/bin/music-dl-desktop", mode = "755" },
-    { source = "icon.png", dest = "/usr/share/icons/hicolor/256x256/apps/music-dl.png", mode = "644" },
-    { source = "music-dl.desktop", dest = "/usr/share/applications/music-dl.desktop", mode = "644" }
+    { source = "target/release/music-dl-desktop-rust", dest = "/usr/bin/music-dl-desktop-rust", mode = "755" },
+    { source = "icon.png", dest = "/usr/share/icons/hicolor/256x256/apps/music-dl-desktop-rust.png", mode = "644" },
+    { source = "music-dl.desktop", dest = "/usr/share/applications/music-dl-desktop-rust.desktop", mode = "644" },
 ]

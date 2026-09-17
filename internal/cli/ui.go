@@ -1,13 +1,10 @@
 package cli
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
-	"path/filepath"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -22,6 +19,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/guohuiyuan/go-music-dl/core"
+	"github.com/guohuiyuan/music-lib/apple"
 	"github.com/guohuiyuan/music-lib/bilibili"
 	"github.com/guohuiyuan/music-lib/fivesing"
 	"github.com/guohuiyuan/music-lib/jamendo"
@@ -34,13 +32,16 @@ import (
 	"github.com/guohuiyuan/music-lib/qianqian"
 	"github.com/guohuiyuan/music-lib/qq"
 	"github.com/guohuiyuan/music-lib/soda"
-	"github.com/guohuiyuan/music-lib/utils"
 )
 
 // --- 常量与样式 ---
 const (
-	CookieFile = "data/cookies.json"
-	UA_Common  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+	UA_Common                = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+	searchTypeSong           = "song"
+	searchTypePlaylist       = "playlist"
+	searchTypeAlbum          = "album"
+	legacyCLIDefaultPageSize = 50
+	listViewReservedRows     = 10
 )
 
 var (
@@ -75,25 +76,89 @@ var (
 
 // --- Cookie 管理 ---
 type CookieManager struct {
-	mu      sync.RWMutex
-	cookies map[string]string
 }
 
-var cm = &CookieManager{cookies: make(map[string]string)}
+var cm = &CookieManager{}
 
 func (m *CookieManager) Load() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	data, err := os.ReadFile(CookieFile)
-	if err == nil {
-		json.Unmarshal(data, &m.cookies)
-	}
+	core.CM.Load()
 }
 
 func (m *CookieManager) Get(source string) string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.cookies[source]
+	return core.CM.Get(source)
+}
+
+func (m *CookieManager) GetAll() map[string]string {
+	return core.CM.GetAll()
+}
+
+func nextSearchType(current string) string {
+	switch current {
+	case searchTypeSong:
+		return searchTypePlaylist
+	case searchTypePlaylist:
+		return searchTypeAlbum
+	default:
+		return searchTypeSong
+	}
+}
+
+func placeholderForSearchType(searchType string) string {
+	switch searchType {
+	case searchTypePlaylist:
+		return "输入歌单关键词或粘贴歌单链接..."
+	case searchTypeAlbum:
+		return "输入专辑关键词或粘贴专辑链接..."
+	default:
+		return "输入歌名、歌手或粘贴分享链接 (Tab 切换)..."
+	}
+}
+
+func searchTypeLabel(searchType string) string {
+	switch searchType {
+	case searchTypePlaylist:
+		return "歌单"
+	case searchTypeAlbum:
+		return "专辑"
+	default:
+		return "单曲"
+	}
+}
+
+func isCollectionSearchType(searchType string) bool {
+	return searchType == searchTypePlaylist || searchType == searchTypeAlbum
+}
+
+func collectionLabel(searchType string) string {
+	if searchType == searchTypeAlbum {
+		return "专辑"
+	}
+	return "歌单"
+}
+
+func collectionCreatorLabel(searchType string) string {
+	if searchType == searchTypeAlbum {
+		return "歌手"
+	}
+	return "创建者"
+}
+
+func collectionCountLabel(searchType string) string {
+	if searchType == searchTypeAlbum {
+		return "曲目数"
+	}
+	return "歌曲数"
+}
+
+func defaultSourcesForSearchType(searchType string) []string {
+	switch searchType {
+	case searchTypePlaylist:
+		return core.GetPlaylistSourceNames()
+	case searchTypeAlbum:
+		return core.GetAlbumSourceNames()
+	default:
+		return core.GetDefaultSourceNames()
+	}
 }
 
 // --- 工厂函数 ---
@@ -123,6 +188,8 @@ func getSearchFunc(source string) func(string) ([]model.Song, error) {
 		return joox.New(c).Search
 	case "qianqian":
 		return qianqian.New(c).Search
+	case "apple":
+		return apple.New(c).Search
 	default:
 		return nil
 	}
@@ -153,6 +220,8 @@ func getDownloadFunc(source string) func(*model.Song) (string, error) {
 		return joox.New(c).GetDownloadURL
 	case "qianqian":
 		return qianqian.New(c).GetDownloadURL
+	case "apple":
+		return apple.New(c).GetDownloadURL
 	default:
 		return nil
 	}
@@ -183,6 +252,8 @@ func getLyricFunc(source string) func(*model.Song) (string, error) {
 		return joox.New(c).GetLyrics
 	case "qianqian":
 		return qianqian.New(c).GetLyrics
+	case "apple":
+		return apple.New(c).GetLyrics
 	default:
 		return nil
 	}
@@ -210,6 +281,12 @@ func getParseFunc(source string) func(string) (*model.Song, error) {
 		return fivesing.New(c).Parse
 	case "jamendo":
 		return jamendo.New(c).Parse
+	case "joox":
+		return joox.New(c).Parse
+	case "qianqian":
+		return qianqian.New(c).Parse
+	case "apple":
+		return apple.New(c).Parse
 	default:
 		return nil
 	}
@@ -227,12 +304,50 @@ func getPlaylistSearchFunc(source string) func(string) ([]model.Playlist, error)
 		return kugou.New(c).SearchPlaylist
 	case "kuwo":
 		return kuwo.New(c).SearchPlaylist
+	case "migu":
+		return migu.New(c).SearchPlaylist
+	case "jamendo":
+		return jamendo.New(c).SearchPlaylist
+	case "joox":
+		return joox.New(c).SearchPlaylist
+	case "qianqian":
+		return qianqian.New(c).SearchPlaylist
 	case "bilibili":
 		return bilibili.New(c).SearchPlaylist
 	case "soda":
 		return soda.New(c).SearchPlaylist
 	case "fivesing":
 		return fivesing.New(c).SearchPlaylist
+	case "apple":
+		return apple.New(c).SearchPlaylist
+	default:
+		return nil
+	}
+}
+
+func getAlbumSearchFunc(source string) func(string) ([]model.Playlist, error) {
+	c := cm.Get(source)
+	switch source {
+	case "netease":
+		return netease.New(c).SearchAlbum
+	case "qq":
+		return qq.New(c).SearchAlbum
+	case "kugou":
+		return kugou.New(c).SearchAlbum
+	case "kuwo":
+		return kuwo.New(c).SearchAlbum
+	case "migu":
+		return migu.New(c).SearchAlbum
+	case "jamendo":
+		return jamendo.New(c).SearchAlbum
+	case "joox":
+		return joox.New(c).SearchAlbum
+	case "qianqian":
+		return qianqian.New(c).SearchAlbum
+	case "soda":
+		return soda.New(c).SearchAlbum
+	case "apple":
+		return apple.New(c).SearchAlbum
 	default:
 		return nil
 	}
@@ -250,12 +365,50 @@ func getPlaylistDetailFunc(source string) func(string) ([]model.Song, error) {
 		return kugou.New(c).GetPlaylistSongs
 	case "kuwo":
 		return kuwo.New(c).GetPlaylistSongs
+	case "migu":
+		return migu.New(c).GetPlaylistSongs
+	case "jamendo":
+		return jamendo.New(c).GetPlaylistSongs
+	case "joox":
+		return joox.New(c).GetPlaylistSongs
+	case "qianqian":
+		return qianqian.New(c).GetPlaylistSongs
 	case "bilibili":
 		return bilibili.New(c).GetPlaylistSongs
 	case "soda":
 		return soda.New(c).GetPlaylistSongs
 	case "fivesing":
 		return fivesing.New(c).GetPlaylistSongs
+	case "apple":
+		return apple.New(c).GetPlaylistSongs
+	default:
+		return nil
+	}
+}
+
+func getAlbumDetailFunc(source string) func(string) ([]model.Song, error) {
+	c := cm.Get(source)
+	switch source {
+	case "netease":
+		return netease.New(c).GetAlbumSongs
+	case "qq":
+		return qq.New(c).GetAlbumSongs
+	case "kugou":
+		return kugou.New(c).GetAlbumSongs
+	case "kuwo":
+		return kuwo.New(c).GetAlbumSongs
+	case "migu":
+		return migu.New(c).GetAlbumSongs
+	case "jamendo":
+		return jamendo.New(c).GetAlbumSongs
+	case "joox":
+		return joox.New(c).GetAlbumSongs
+	case "qianqian":
+		return qianqian.New(c).GetAlbumSongs
+	case "soda":
+		return soda.New(c).GetAlbumSongs
+	case "apple":
+		return apple.New(c).GetAlbumSongs
 	default:
 		return nil
 	}
@@ -290,12 +443,50 @@ func getParsePlaylistFunc(source string) func(string) (*model.Playlist, []model.
 		return kugou.New(c).ParsePlaylist
 	case "kuwo":
 		return kuwo.New(c).ParsePlaylist
+	case "migu":
+		return migu.New(c).ParsePlaylist
+	case "jamendo":
+		return jamendo.New(c).ParsePlaylist
+	case "joox":
+		return joox.New(c).ParsePlaylist
+	case "qianqian":
+		return qianqian.New(c).ParsePlaylist
 	case "bilibili":
 		return bilibili.New(c).ParsePlaylist
 	case "soda":
 		return soda.New(c).ParsePlaylist
 	case "fivesing":
 		return fivesing.New(c).ParsePlaylist
+	case "apple":
+		return apple.New(c).ParsePlaylist
+	default:
+		return nil
+	}
+}
+
+func getParseAlbumFunc(source string) func(string) (*model.Playlist, []model.Song, error) {
+	c := cm.Get(source)
+	switch source {
+	case "netease":
+		return netease.New(c).ParseAlbum
+	case "qq":
+		return qq.New(c).ParseAlbum
+	case "kugou":
+		return kugou.New(c).ParseAlbum
+	case "kuwo":
+		return kuwo.New(c).ParseAlbum
+	case "migu":
+		return migu.New(c).ParseAlbum
+	case "jamendo":
+		return jamendo.New(c).ParseAlbum
+	case "joox":
+		return joox.New(c).ParseAlbum
+	case "qianqian":
+		return qianqian.New(c).ParseAlbum
+	case "soda":
+		return soda.New(c).ParseAlbum
+	case "apple":
+		return apple.New(c).ParseAlbum
 	default:
 		return nil
 	}
@@ -318,17 +509,26 @@ func detectSource(link string) string {
 	if strings.Contains(link, "migu.cn") {
 		return "migu"
 	}
+	if strings.Contains(link, "joox.com") {
+		return "joox"
+	}
 	if strings.Contains(link, "bilibili.com") || strings.Contains(link, "b23.tv") {
 		return "bilibili"
 	}
 	if strings.Contains(link, "douyin.com") || strings.Contains(link, "qishui") {
 		return "soda"
 	}
+	if strings.Contains(link, "91q.com") {
+		return "qianqian"
+	}
 	if strings.Contains(link, "5sing") {
 		return "fivesing"
 	}
 	if strings.Contains(link, "jamendo.com") {
 		return "jamendo"
+	}
+	if strings.Contains(link, "music.apple.com") || strings.Contains(link, "itunes.apple.com") {
+		return "apple"
 	}
 	return ""
 }
@@ -337,12 +537,13 @@ func detectSource(link string) string {
 type sessionState int
 
 const (
-	stateInput          sessionState = iota // 输入搜索词
-	stateLoading                            // 搜索中
-	stateList                               // 歌曲结果列表 & 选择
-	statePlaylistResult                     // 歌单结果列表
-	stateDownloading                        // 下载中
-	stateSwitching                          // 换源中
+	stateInput           sessionState = iota // 输入搜索词
+	stateLoading                             // 搜索中
+	stateList                                // 歌曲结果列表 & 选择
+	statePlaylistResult                      // 歌单结果列表
+	stateDownloading                         // 下载中
+	stateConfirmDownload                     // 下载前确认
+	stateSwitching                           // 换源中
 )
 
 // --- 主模型 ---
@@ -352,7 +553,7 @@ type modelState struct {
 	spinner   spinner.Model   // 加载动画
 	progress  progress.Model  // 进度条组件
 
-	searchType string           // "song" or "playlist"
+	searchType string           // "song", "playlist" or "album"
 	songs      []model.Song     // 歌曲结果
 	playlists  []model.Playlist // 歌单结果
 	selected   map[int]struct{} // 已选中的索引集合 (多选)
@@ -365,9 +566,12 @@ type modelState struct {
 	withLyrics bool
 
 	// 下载队列管理
-	downloadQueue []model.Song // 待下载队列
-	totalToDl     int          // 总共需要下载的数量
-	downloaded    int          // 已完成数量
+	downloadQueue []model.Song            // 待下载队列
+	totalToDl     int                     // 总共需要下载的数量
+	downloaded    int                     // 成功完成数量
+	skipped       int                     // 已存在跳过数量
+	failed        int                     // 失败数量
+	allSongsSet   core.DownloadDedupIndex // SQLite 去重集合，批量下载时复用
 
 	// 换源队列管理
 	switchQueue []int
@@ -377,7 +581,14 @@ type modelState struct {
 	err       error
 	statusMsg string // 底部状态栏消息
 
-	windowWidth int
+	// 试听播放 (ffplay)
+	playCmd      *exec.Cmd // 当前 ffplay 进程
+	playingName  string    // 正在播放的歌名，用于状态栏
+	playTempFile string    // soda 等临时文件，停止时删除
+
+	windowWidth  int
+	windowHeight int
+	pageSize     int
 }
 
 // 启动 UI 的入口
@@ -387,6 +598,7 @@ func StartUI(initialKeyword string, sources []string, outDir string, withCover b
 
 	ti := textinput.New()
 	ti.Placeholder = "输入歌名、歌手或粘贴分享链接 (Tab 切换搜歌单)..."
+	ti.Placeholder = placeholderForSearchType(searchTypeSong)
 	ti.Focus()
 	ti.CharLimit = 256
 	ti.Width = 50
@@ -397,6 +609,12 @@ func StartUI(initialKeyword string, sources []string, outDir string, withCover b
 
 	prog := progress.New(progress.WithDefaultGradient())
 
+	settings := core.GetWebSettings()
+	pageSize := settings.CliPageSize
+	if pageSize <= 0 {
+		pageSize = core.DefaultCLIPageSize
+	}
+
 	initialState := stateInput
 	if initialKeyword != "" {
 		ti.SetValue(initialKeyword)
@@ -405,7 +623,7 @@ func StartUI(initialKeyword string, sources []string, outDir string, withCover b
 
 	m := modelState{
 		state:      initialState,
-		searchType: "song",
+		searchType: searchTypeSong,
 		textInput:  ti,
 		spinner:    sp,
 		progress:   prog,
@@ -414,6 +632,7 @@ func StartUI(initialKeyword string, sources []string, outDir string, withCover b
 		outDir:     outDir,
 		withCover:  withCover,
 		withLyrics: withLyrics,
+		pageSize:   pageSize,
 	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
@@ -435,11 +654,13 @@ func (m modelState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
+			m.stopPlayback()
 			return m, tea.Quit
 		}
 
 	case tea.WindowSizeMsg:
 		m.windowWidth = msg.Width
+		m.windowHeight = msg.Height
 		m.progress.Width = msg.Width - 10
 		if m.progress.Width > 50 {
 			m.progress.Width = 50
@@ -459,6 +680,8 @@ func (m modelState) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateDownloading(msg)
 	case stateSwitching:
 		return m.updateSwitching(msg)
+	case stateConfirmDownload:
+		return m.updateConfirmDownload(msg)
 	}
 
 	return m, nil
@@ -469,6 +692,11 @@ func (m modelState) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if msg.Type == tea.KeyTab {
+			m.searchType = nextSearchType(m.searchType)
+			m.textInput.Placeholder = placeholderForSearchType(m.searchType)
+			return m, nil
+		}
 		switch msg.Type {
 		case tea.KeyTab: // 切换搜索类型
 			if m.searchType == "song" {
@@ -497,7 +725,8 @@ func (m modelState) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch km.String() {
 		case "w":
 			m.state = stateLoading
-			m.searchType = "playlist"
+			m.searchType = searchTypePlaylist
+			m.textInput.Placeholder = placeholderForSearchType(m.searchType)
 			m.songs = nil
 			m.playlists = nil
 			m.statusMsg = "正在获取每日推荐歌单..."
@@ -523,6 +752,7 @@ func (m modelState) updateLoading(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case searchResultMsg:
 		m.songs = msg
+		m.playlists = nil
 		m.state = stateList
 		m.cursor = 0
 		m.selected = make(map[int]struct{})
@@ -533,17 +763,22 @@ func (m modelState) updateLoading(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMsg = fmt.Sprintf("解析成功: %s。按回车下载。", m.songs[0].Name)
 		} else {
 			if m.searchType == "playlist" { // 从歌单进入
-				m.statusMsg = fmt.Sprintf("歌单解析完成，包含 %d 首歌曲。空格选择，回车下载。", len(m.songs))
+				m.statusMsg = fmt.Sprintf("歌单解析完成，包含 %d 首歌曲（每页 %d）。空格选择，回车下载。", len(m.songs), m.currentPageSize())
 			} else {
-				m.statusMsg = fmt.Sprintf("找到 %d 首歌曲。空格选择，回车下载。", len(m.songs))
+				m.statusMsg = fmt.Sprintf("找到 %d 首歌曲（每页 %d）。空格选择，回车下载。", len(m.songs), m.currentPageSize())
 			}
+		}
+		if isCollectionSearchType(m.searchType) && !(len(m.songs) == 1 && strings.HasPrefix(m.textInput.Value(), "http")) {
+			m.statusMsg = fmt.Sprintf("%s解析完成，包含 %d 首歌曲（每页 %d）。空格选择，回车下载。", collectionLabel(m.searchType), len(m.songs), m.currentPageSize())
 		}
 		return m, nil
 	case playlistResultMsg:
 		m.playlists = msg
+		m.songs = nil
 		m.state = statePlaylistResult
 		m.cursor = 0
-		m.statusMsg = fmt.Sprintf("找到 %d 个歌单。回车查看详情。", len(m.playlists))
+		m.statusMsg = fmt.Sprintf("找到 %d 个歌单（每页 %d）。回车查看详情。", len(m.playlists), m.currentPageSize())
+		m.statusMsg = fmt.Sprintf("找到 %d 个%s（每页 %d）。回车查看详情。", len(m.playlists), collectionLabel(m.searchType), m.currentPageSize())
 		return m, textinput.Blink
 	case searchErrorMsg:
 		m.state = stateInput
@@ -566,6 +801,10 @@ func (m modelState) updatePlaylistResult(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor < len(m.playlists)-1 {
 				m.cursor++
 			}
+		case "pgup":
+			m.cursor = m.moveCursorByPage(m.cursor, -1, len(m.playlists))
+		case "pgdown":
+			m.cursor = m.moveCursorByPage(m.cursor, 1, len(m.playlists))
 		case "q":
 			return m, tea.Quit
 		case "esc", "b":
@@ -576,6 +815,14 @@ func (m modelState) updatePlaylistResult(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if len(m.playlists) > 0 {
 				target := m.playlists[m.cursor]
+				if m.searchType == searchTypePlaylist || m.searchType == searchTypeAlbum {
+					m.state = stateLoading
+					m.statusMsg = fmt.Sprintf("正在获取%s [%s] 详情...", collectionLabel(m.searchType), target.Name)
+					return m, tea.Batch(
+						m.spinner.Tick,
+						fetchCollectionSongsCmd(target.ID, target.Source, m.searchType),
+					)
+				}
 				m.state = stateLoading
 				m.statusMsg = fmt.Sprintf("正在获取歌单 [%s] 详情...", target.Name)
 				return m, tea.Batch(
@@ -601,6 +848,10 @@ func (m modelState) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor < len(m.songs)-1 {
 				m.cursor++
 			}
+		case "pgup":
+			m.cursor = m.moveCursorByPage(m.cursor, -1, len(m.songs))
+		case "pgdown":
+			m.cursor = m.moveCursorByPage(m.cursor, 1, len(m.songs))
 		case " ":
 			if _, ok := m.selected[m.cursor]; ok {
 				delete(m.selected, m.cursor)
@@ -618,12 +869,31 @@ func (m modelState) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.statusMsg = fmt.Sprintf("已选中全部 %d 首歌曲", len(m.songs))
 			}
 		case "q":
+			m.stopPlayback()
 			return m, tea.Quit
 		case "esc", "b":
+			m.stopPlayback()
 			m.state = stateInput
 			m.textInput.SetValue("")
 			m.textInput.Focus()
 			return m, textinput.Blink
+		case "p":
+			if len(m.songs) == 0 || m.cursor < 0 || m.cursor >= len(m.songs) {
+				return m, nil
+			}
+			m.stopPlayback()
+			if err := m.startPlayback(m.songs[m.cursor]); err != nil {
+				m.statusMsg = fmt.Sprintf("播放失败: %v", err)
+			} else {
+				m.statusMsg = fmt.Sprintf("▶ 正在播放: %s", m.playingName)
+			}
+			return m, nil
+		case "s":
+			if m.playCmd != nil {
+				m.stopPlayback()
+				m.statusMsg = "⏹ 已停止播放"
+			}
+			return m, nil
 		case "enter":
 			if len(m.selected) == 0 {
 				m.selected[m.cursor] = struct{}{}
@@ -638,13 +908,18 @@ func (m modelState) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			m.totalToDl = len(m.downloadQueue)
 			m.downloaded = 0
-			m.state = stateDownloading
-			m.statusMsg = "正在准备下载..."
+			m.skipped = 0
+			m.failed = 0
+			m.allSongsSet, _ = core.LoadDownloadDedupSet()
 
-			return m, tea.Batch(
-				m.spinner.Tick,
-				downloadNextCmd(m.downloadQueue, m.outDir, m.withCover, m.withLyrics),
-			)
+			skipCount := core.CountSkippable(m.downloadQueue, m.allSongsSet, m.outDir)
+			m.state = stateConfirmDownload
+			if skipCount > 0 {
+				m.statusMsg = fmt.Sprintf("共 %d 首，其中 %d 首已在本地曲库（将跳过），Enter 确认下载 / Esc 取消", m.totalToDl, skipCount)
+			} else {
+				m.statusMsg = fmt.Sprintf("共 %d 首，确认开始下载？Enter 确认 / Esc 取消", m.totalToDl)
+			}
+			return m, nil
 		case "r":
 			if len(m.songs) == 0 || m.cursor < 0 || m.cursor >= len(m.songs) {
 				return m, nil
@@ -682,8 +957,9 @@ func (m modelState) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // --- 4. 下载状态逻辑 ---
 type downloadOneFinishedMsg struct {
-	err  error
-	song model.Song
+	err     error
+	song    model.Song
+	skipped bool // 因已存在而跳过
 }
 
 type switchSourceResultMsg struct {
@@ -705,30 +981,54 @@ func (m modelState) updateDownloading(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case downloadOneFinishedMsg:
-		m.downloaded++
-
-		resultStr := fmt.Sprintf("已完成: %s - %s", msg.song.Name, msg.song.Artist)
-		if msg.err != nil {
-			resultStr = fmt.Sprintf("❌ 失败: %s - %s (%v)", msg.song.Name, msg.song.Artist, msg.err)
+		if msg.skipped {
+			m.skipped++
+			m.statusMsg = fmt.Sprintf("⏭ 已跳过: %s - %s (已存在)", msg.song.Name, msg.song.Artist)
+		} else if msg.err != nil {
+			m.failed++
+			m.statusMsg = fmt.Sprintf("❌ 失败: %s - %s (%v)", msg.song.Name, msg.song.Artist, msg.err)
+		} else {
+			m.downloaded++
+			m.statusMsg = fmt.Sprintf("✅ 完成: %s - %s", msg.song.Name, msg.song.Artist)
 		}
-		m.statusMsg = resultStr
 
-		pct := float64(m.downloaded) / float64(m.totalToDl)
+		pct := float64(m.downloaded+m.skipped+m.failed) / float64(m.totalToDl)
 		if len(m.downloadQueue) > 0 {
 			m.downloadQueue = m.downloadQueue[1:]
 		}
 
 		cmds := []tea.Cmd{m.progress.SetPercent(pct)}
 
-		if m.downloaded >= m.totalToDl {
+		if m.downloaded+m.skipped+m.failed >= m.totalToDl {
 			m.state = stateList
 			m.selected = make(map[int]struct{})
-			m.statusMsg = fmt.Sprintf("✅ 任务结束，共下载 %d 首歌曲", m.downloaded)
+			m.statusMsg = fmt.Sprintf("✅ 任务结束  成功: %d | 跳过: %d | 失败: %d", m.downloaded, m.skipped, m.failed)
 			return m, nil
 		}
 
-		cmds = append(cmds, downloadNextCmd(m.downloadQueue, m.outDir, m.withCover, m.withLyrics))
+		cmds = append(cmds, downloadNextCmd(m.downloadQueue, m.outDir, m.withCover, m.withLyrics, m.allSongsSet))
 		return m, tea.Batch(cmds...)
+	}
+	return m, nil
+}
+
+// --- 4.3 下载前确认状态逻辑 ---
+func (m modelState) updateConfirmDownload(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "enter":
+			m.state = stateDownloading
+			m.statusMsg = "正在准备下载..."
+			return m, tea.Batch(
+				m.spinner.Tick,
+				downloadNextCmd(m.downloadQueue, m.outDir, m.withCover, m.withLyrics, m.allSongsSet),
+			)
+		case "esc":
+			m.state = stateList
+			m.statusMsg = "已取消下载"
+			return m, nil
+		}
 	}
 	return m, nil
 }
@@ -888,17 +1188,21 @@ func searchCmd(keyword string, searchType string, sources []string) tea.Cmd {
 				}
 			}
 
+			parseAlbumFn := getParseAlbumFunc(src)
+			if parseAlbumFn != nil {
+				if _, songs, err := parseAlbumFn(keyword); err == nil && len(songs) > 0 {
+					probeSongsBatch(songs)
+					return searchResultMsg(songs)
+				}
+			}
+
 			return searchErrorMsg(fmt.Errorf("解析失败: 暂不支持 %s 平台的此链接类型或解析出错", src))
 		}
 
 		// 2. 关键词搜索模式
 		targetSources := sources
 		if len(targetSources) == 0 {
-			if searchType == "playlist" {
-				targetSources = core.GetPlaylistSourceNames()
-			} else {
-				targetSources = core.GetDefaultSourceNames()
-			}
+			targetSources = defaultSourcesForSearchType(searchType)
 		}
 
 		var wg sync.WaitGroup
@@ -933,6 +1237,33 @@ func searchCmd(keyword string, searchType string, sources []string) tea.Cmd {
 		}
 
 		// 2.2 单曲搜索
+		if searchType == searchTypeAlbum {
+			var allAlbums []model.Playlist
+			for _, src := range targetSources {
+				fn := getAlbumSearchFunc(src)
+				if fn == nil {
+					continue
+				}
+				wg.Add(1)
+				go func(s string, f func(string) ([]model.Playlist, error)) {
+					defer wg.Done()
+					if res, err := f(keyword); err == nil {
+						for i := range res {
+							res[i].Source = s
+						}
+						mu.Lock()
+						allAlbums = append(allAlbums, res...)
+						mu.Unlock()
+					}
+				}(src, fn)
+			}
+			wg.Wait()
+			if len(allAlbums) == 0 {
+				return searchErrorMsg(fmt.Errorf("未找到专辑"))
+			}
+			return playlistResultMsg(allAlbums)
+		}
+
 		var allSongs []model.Song
 		for _, src := range targetSources {
 			fn := getSearchFunc(src)
@@ -947,9 +1278,6 @@ func searchCmd(keyword string, searchType string, sources []string) tea.Cmd {
 				if err == nil && len(res) > 0 {
 					for i := range res {
 						res[i].Source = s
-					}
-					if len(res) > 10 {
-						res = res[:10]
 					}
 					mu.Lock()
 					allSongs = append(allSongs, res...)
@@ -1004,11 +1332,17 @@ func recommendPlaylistsCmd(sources []string) tea.Cmd {
 	}
 }
 
-func fetchPlaylistSongsCmd(id, source string) tea.Cmd {
+func fetchCollectionSongsCmd(id, source, searchType string) tea.Cmd {
 	return func() tea.Msg {
-		fn := getPlaylistDetailFunc(source)
+		var fn func(string) ([]model.Song, error)
+		switch searchType {
+		case searchTypeAlbum:
+			fn = getAlbumDetailFunc(source)
+		default:
+			fn = getPlaylistDetailFunc(source)
+		}
 		if fn == nil {
-			return searchErrorMsg(fmt.Errorf("Go source %s not support playlist detail", source))
+			return searchErrorMsg(fmt.Errorf("%s 源暂不支持%s详情", source, collectionLabel(searchType)))
 		}
 		songs, err := fn(id)
 		if err != nil {
@@ -1026,14 +1360,22 @@ func fetchPlaylistSongsCmd(id, source string) tea.Cmd {
 }
 
 // 单曲下载命令
-func downloadNextCmd(queue []model.Song, outDir string, withCover bool, withLyrics bool) tea.Cmd {
+func fetchPlaylistSongsCmd(id, source string) tea.Cmd {
+	return fetchCollectionSongsCmd(id, source, searchTypePlaylist)
+}
+
+func downloadNextCmd(queue []model.Song, outDir string, withCover bool, withLyrics bool, allSongsSet core.DownloadDedupIndex) tea.Cmd {
 	return func() tea.Msg {
 		if len(queue) == 0 {
 			return nil
 		}
 		target := queue[0]
-		err := downloadSongWithCookie(&target, outDir, withCover, withLyrics)
-		return downloadOneFinishedMsg{err: err, song: target}
+		result, err := core.DownloadWithDedupCheck(&target, outDir, withCover, withLyrics, allSongsSet)
+		return downloadOneFinishedMsg{
+			err:     err,
+			song:    target,
+			skipped: err == nil && result != nil && result.Skipped,
+		}
 	}
 }
 
@@ -1045,122 +1387,50 @@ func switchSourceCmd(index int, song model.Song) tea.Cmd {
 	}
 }
 
-// 内部下载实现（支持 ID3 元数据内嵌）
-func downloadSongWithCookie(song *model.Song, outDir string, withCover bool, withLyrics bool) error {
-	// 1. 准备目录
-	if err := os.MkdirAll(outDir, 0755); err != nil {
+// stopPlayback 停止当前 ffplay 进程并清理临时文件。
+func (m *modelState) stopPlayback() {
+	if m.playCmd != nil && m.playCmd.Process != nil {
+		_ = m.playCmd.Process.Kill()
+		_ = m.playCmd.Wait()
+	}
+	m.playCmd = nil
+	if m.playTempFile != "" {
+		_ = os.Remove(m.playTempFile)
+		m.playTempFile = ""
+	}
+	m.playingName = ""
+}
+
+// startPlayback 启动 ffplay 试听指定歌曲。
+func (m *modelState) startPlayback(song model.Song) error {
+	ffplayPath, err := core.ResolveFFplayPath()
+	if err != nil || ffplayPath == "" {
+		return fmt.Errorf("未找到 ffplay，请确认已安装 ffmpeg 并在 PATH 中")
+	}
+
+	playURL, tempFile, err := core.PreparePlaybackSource(&song)
+	if err != nil {
 		return err
 	}
 
-	fileName := fmt.Sprintf("%s - %s", utils.SanitizeFilename(song.Name), utils.SanitizeFilename(song.Artist))
-
-	// 2. 获取下载数据
-	var finalData []byte
-
-	// Soda 特殊处理 (加密)
-	if song.Source == "soda" {
-		cookie := cm.Get("soda")
-		sodaInst := soda.New(cookie)
-		info, err := sodaInst.GetDownloadInfo(song)
-		if err != nil {
-			return err
+	cmd := exec.Command(ffplayPath, core.PlaybackArgs(&song, playURL)...)
+	if err := cmd.Start(); err != nil {
+		if tempFile != "" {
+			_ = os.Remove(tempFile)
 		}
-
-		req, _ := http.NewRequest("GET", info.URL, nil)
-		req.Header.Set("User-Agent", UA_Common)
-		resp, err := (&http.Client{}).Do(req)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-
-		encryptedData, _ := io.ReadAll(resp.Body)
-		finalData, err = soda.DecryptAudio(encryptedData, info.PlayAuth)
-		if err != nil {
-			return err
-		}
-	} else {
-		// 常规源处理
-		dlFunc := getDownloadFunc(song.Source)
-		if dlFunc == nil {
-			return fmt.Errorf("不支持的源: %s", song.Source)
-		}
-
-		urlStr, err := dlFunc(song)
-		if err != nil {
-			return err
-		}
-		if urlStr == "" {
-			return fmt.Errorf("下载链接为空")
-		}
-
-		req, _ := http.NewRequest("GET", urlStr, nil)
-		req.Header.Set("User-Agent", UA_Common)
-		if song.Source == "bilibili" {
-			req.Header.Set("Referer", "https://www.bilibili.com/")
-		}
-		if song.Source == "qq" {
-			req.Header.Set("Referer", "http://y.qq.com")
-		}
-		if song.Source == "migu" {
-			req.Header.Set("Referer", "http://music.migu.cn/")
-		}
-
-		resp, err := (&http.Client{}).Do(req)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-
-		finalData, err = io.ReadAll(resp.Body)
-		if err != nil {
-			return err
-		}
-	}
-
-	// 3. 获取歌词并内嵌到 ID3（如启用）
-	var lyricStr string
-	if withLyrics {
-		if lrcFunc := getLyricFunc(song.Source); lrcFunc != nil {
-			if lrc, err := lrcFunc(song); err == nil && lrc != "" {
-				lyricStr = lrc
-			}
-		}
-	}
-
-	// 4. 获取封面并内嵌到 ID3（如启用）
-	var coverData []byte
-	var coverMime string
-	if withCover && song.Cover != "" {
-		if data, err := utils.Get(song.Cover); err == nil && len(data) > 0 {
-			coverData = data
-			coverMime = http.DetectContentType(data)
-			if idx := strings.Index(coverMime, ";"); idx >= 0 {
-				coverMime = strings.TrimSpace(coverMime[:idx])
-			}
-		}
-	}
-
-	// 5. 内嵌元数据到 ID3（如有数据）
-	ext := core.DetectAudioExt(finalData)
-
-	if (ext == "mp3" || ext == "flac" || ext == "m4a" || ext == "wma") && (lyricStr != "" || len(coverData) > 0) {
-		if embeddedData, err := core.EmbedSongMetadata(finalData, song, lyricStr, coverData, coverMime); err == nil {
-			finalData = embeddedData
-		} else if errors.Is(err, core.ErrFFmpegNotFound) {
-			fmt.Printf("⚠ 未检测到 ffmpeg，已跳过歌词/封面嵌入，仍会正常下载音频\n")
-		} else {
-			fmt.Printf("⚠ 音频元数据嵌入失败，已使用原始音频继续保存: %v\n", err)
-		}
-	}
-
-	// 6. 写入文件
-	filePath := filepath.Join(outDir, fileName+"."+ext)
-	if err := os.WriteFile(filePath, finalData, 0644); err != nil {
 		return err
 	}
 
+	m.playCmd = cmd
+	m.playTempFile = tempFile
+	m.playingName = song.Display()
 	return nil
+}
+
+// 内部下载实现（支持去重检查和记录）
+func downloadSongWithCookie(song *model.Song, outDir string, withCover bool, withLyrics bool, allSongsSet core.DownloadDedupIndex) error {
+	_, err := core.DownloadWithDedupCheck(song, outDir, withCover, withLyrics, allSongsSet)
+	return err
 }
 
 // --- 换源逻辑（与 Web 相同约束） ---
@@ -1437,6 +1707,10 @@ func getSourceDisplay(s []string) string {
 
 func (m modelState) View() string {
 	var s strings.Builder
+	if m.state == stateInput {
+		s.WriteString(m.renderInputView())
+		return s.String()
+	}
 	s.WriteString(lipgloss.NewStyle().Foreground(primaryColor).Bold(true).Render("\n🎵 Go Music DL TUI") + "\n\n")
 
 	switch m.state {
@@ -1450,17 +1724,16 @@ func (m modelState) View() string {
 		s.WriteString(fmt.Sprintf("\n\n(当前源: %v)", getSourceDisplay(m.sources)))
 		s.WriteString(fmt.Sprintf("\n(当前模式: %s搜索)", modeLabel))
 		s.WriteString("\n(按 Enter 搜索/解析, Tab 切换搜歌/歌单, w 每日推荐, Ctrl+C 退出)")
-		cm.mu.RLock()
-		if len(cm.cookies) > 0 {
-			var loadedSources []string
-			for k := range cm.cookies {
+		cookies := cm.GetAll()
+		if len(cookies) > 0 {
+			loadedSources := make([]string, 0, len(cookies))
+			for k := range cookies {
 				loadedSources = append(loadedSources, k)
 			}
+			sort.Strings(loadedSources)
 			cookieHint := fmt.Sprintf("\n(已加载 Cookie: %s)", strings.Join(loadedSources, ", "))
 			s.WriteString(lipgloss.NewStyle().Foreground(greenColor).Render(cookieHint))
 		}
-		cm.mu.RUnlock()
-
 		if m.err != nil {
 			s.WriteString(lipgloss.NewStyle().Foreground(redColor).Render(fmt.Sprintf("\n\n❌ %v", m.err)))
 		}
@@ -1472,27 +1745,56 @@ func (m modelState) View() string {
 		statusStyle := lipgloss.NewStyle().Foreground(subtleColor)
 		s.WriteString(statusStyle.Render(m.statusMsg))
 		s.WriteString("\n\n")
-		s.WriteString(statusStyle.Render("↑/↓: 移动 • 空格: 选择 • a: 全选/清空 • r: 换源 • Enter: 下载 • b: 返回 • q: 退出"))
+		s.WriteString(statusStyle.Render("↑/↓: 移动 • PgUp/PgDn: 翻页 • 空格: 选择 • a: 全选/清空 • p: 播放 • s: 停止 • r: 换源 • Enter: 下载 • b: 返回 • q: 退出"))
 	case statePlaylistResult: // 新增
-		s.WriteString(m.renderPlaylistTable())
+		s.WriteString(m.renderCollectionTable())
 		s.WriteString("\n")
 		statusStyle := lipgloss.NewStyle().Foreground(subtleColor)
 		s.WriteString(statusStyle.Render(m.statusMsg))
 		s.WriteString("\n\n")
-		s.WriteString(statusStyle.Render("↑/↓: 移动 • Enter: 查看详情 • b: 返回 • q: 退出"))
+		s.WriteString(statusStyle.Render("↑/↓: 移动 • PgUp/PgDn: 翻页 • Enter: 查看详情 • b: 返回 • q: 退出"))
 	case stateDownloading:
 		s.WriteString("\n")
 		s.WriteString(m.progress.View() + "\n\n")
-		s.WriteString(fmt.Sprintf("%s 正在处理: %d/%d\n", m.spinner.View(), m.downloaded, m.totalToDl))
+		s.WriteString(fmt.Sprintf("%s 成功: %d | 跳过: %d | 失败: %d  (共 %d)\n", m.spinner.View(), m.downloaded, m.skipped, m.failed, m.totalToDl))
 		if len(m.downloadQueue) > 0 {
 			current := m.downloadQueue[0]
 			s.WriteString(lipgloss.NewStyle().Foreground(yellowColor).Render(fmt.Sprintf("-> %s - %s", current.Name, current.Artist)))
 		}
 		s.WriteString("\n\n" + lipgloss.NewStyle().Foreground(subtleColor).Render(m.statusMsg))
+	case stateConfirmDownload:
+		s.WriteString("\n")
+		s.WriteString(lipgloss.NewStyle().Foreground(yellowColor).Render("⚠ 下载确认\n\n"))
+		s.WriteString(lipgloss.NewStyle().Foreground(subtleColor).Render(m.statusMsg + "\n\n"))
+		s.WriteString(lipgloss.NewStyle().Foreground(subtleColor).Render("Enter: 确认下载  •  Esc: 取消"))
 	case stateSwitching:
 		s.WriteString("\n")
 		s.WriteString(m.progress.View() + "\n\n")
 		s.WriteString(fmt.Sprintf("%s %s\n", m.spinner.View(), m.statusMsg))
+	}
+	return s.String()
+}
+
+func (m modelState) renderInputView() string {
+	var s strings.Builder
+	s.WriteString("请输入搜索关键字:\n")
+	s.WriteString(m.textInput.View())
+	s.WriteString(fmt.Sprintf("\n\n(当前源: %v)", getSourceDisplay(m.sources)))
+	s.WriteString(fmt.Sprintf("\n(当前模式: %s搜索)", searchTypeLabel(m.searchType)))
+	s.WriteString("\n(按 Enter 搜索/解析, Tab 切换单曲/歌单/专辑, w 每日推荐, Ctrl+C 退出)")
+
+	cookies := cm.GetAll()
+	if len(cookies) > 0 {
+		loadedSources := make([]string, 0, len(cookies))
+		for k := range cookies {
+			loadedSources = append(loadedSources, k)
+		}
+		sort.Strings(loadedSources)
+		cookieHint := fmt.Sprintf("\n(已加载 Cookie: %s)", strings.Join(loadedSources, ", "))
+		s.WriteString(lipgloss.NewStyle().Foreground(greenColor).Render(cookieHint))
+	}
+	if m.err != nil {
+		s.WriteString(lipgloss.NewStyle().Foreground(redColor).Render(fmt.Sprintf("\n\n错误: %v", m.err)))
 	}
 	return s.String()
 }
@@ -1522,6 +1824,8 @@ func (m modelState) renderTable() string {
 		headerStyle.Width(colSrc).Render("来源"),
 	)
 	b.WriteString(header + "\n")
+	currentPage, totalPages := m.currentPageInfo(len(m.songs))
+	b.WriteString(lipgloss.NewStyle().Foreground(subtleColor).Render(fmt.Sprintf("第 %d/%d 页，每页 %d 条", currentPage, totalPages, m.currentPageSize())) + "\n")
 	start, end := m.calculatePagination()
 	for i := start; i < end; i++ {
 		song := m.songs[i]
@@ -1592,18 +1896,10 @@ func (m modelState) renderPlaylistTable() string {
 	)
 	b.WriteString(header + "\n")
 
-	height := 15
-	start := 0
-	end := len(m.playlists)
-	if len(m.playlists) > height {
-		if m.cursor >= height {
-			start = m.cursor - height + 1
-		}
-		end = start + height
-		if end > len(m.playlists) {
-			end = len(m.playlists)
-		}
-	}
+	currentPage, totalPages := m.currentPageInfo(len(m.playlists))
+	b.WriteString(lipgloss.NewStyle().Foreground(subtleColor).Render(fmt.Sprintf("第 %d/%d 页，每页 %d 条", currentPage, totalPages, m.currentPageSize())) + "\n")
+
+	start, end := m.calculatePlaylistPagination()
 
 	for i := start; i < end; i++ {
 		pl := m.playlists[i]
@@ -1634,18 +1930,132 @@ func (m modelState) renderPlaylistTable() string {
 	return b.String()
 }
 
-func (m modelState) calculatePagination() (int, int) {
-	height := 15
-	start := 0
-	end := len(m.songs)
-	if len(m.songs) > height {
-		if m.cursor >= height {
-			start = m.cursor - height + 1
+func (m modelState) renderCollectionTable() string {
+	const (
+		colIdx     = 4
+		colTitle   = 40
+		colCount   = 10
+		colCreator = 20
+		colSrc     = 10
+	)
+
+	var b strings.Builder
+	header := lipgloss.JoinHorizontal(lipgloss.Left,
+		headerStyle.Width(colIdx).Render("ID"),
+		headerStyle.Width(colTitle).Render(collectionLabel(m.searchType)+"名称"),
+		headerStyle.Width(colCount).Render(collectionCountLabel(m.searchType)),
+		headerStyle.Width(colCreator).Render(collectionCreatorLabel(m.searchType)),
+		headerStyle.Width(colSrc).Render("来源"),
+	)
+	b.WriteString(header + "\n")
+
+	currentPage, totalPages := m.currentPageInfo(len(m.playlists))
+	b.WriteString(lipgloss.NewStyle().Foreground(subtleColor).Render(fmt.Sprintf("第 %d/%d 页，每页 %d 条", currentPage, totalPages, m.currentPageSize())) + "\n")
+
+	start, end := m.calculatePlaylistPagination()
+	for i := start; i < end; i++ {
+		pl := m.playlists[i]
+		isCursor := (m.cursor == i)
+
+		idxStr := fmt.Sprintf("%d", i+1)
+		title := truncate(pl.Name, colTitle-2)
+		count := fmt.Sprintf("%d", pl.TrackCount)
+		creator := truncate(pl.Creator, colCreator-2)
+		src := pl.Source
+
+		style := rowStyle
+		if isCursor {
+			style = selectedRowStyle
 		}
-		end = start + height
-		if end > len(m.songs) {
-			end = len(m.songs)
+		renderCell := func(text string, width int, style lipgloss.Style) string {
+			return style.Width(width).MaxHeight(1).Render(text)
+		}
+		row := lipgloss.JoinHorizontal(lipgloss.Left,
+			renderCell(idxStr, colIdx, style),
+			renderCell(title, colTitle, style),
+			renderCell(count, colCount, style),
+			renderCell(creator, colCreator, style),
+			renderCell(src, colSrc, style),
+		)
+		b.WriteString(row + "\n")
+	}
+	return b.String()
+}
+
+func (m modelState) calculatePagination() (int, int) {
+	return m.pageRangeForCursor(len(m.songs))
+}
+
+func (m modelState) calculatePlaylistPagination() (int, int) {
+	return m.pageRangeForCursor(len(m.playlists))
+}
+
+func (m modelState) currentPageSize() int {
+	if m.pageSize <= 0 {
+		return core.DefaultCLIPageSize
+	}
+	pageSize := m.pageSize
+	if pageSize == legacyCLIDefaultPageSize {
+		if maxRows := m.maxRowsForListView(); maxRows > 0 && maxRows < pageSize {
+			pageSize = maxRows
 		}
 	}
+	return pageSize
+}
+
+func (m modelState) maxRowsForListView() int {
+	if m.windowHeight <= 0 {
+		return 0
+	}
+	available := m.windowHeight - listViewReservedRows
+	if available < 1 {
+		return 1
+	}
+	return available
+}
+
+func (m modelState) pageRangeForCursor(total int) (int, int) {
+	if total <= 0 {
+		return 0, 0
+	}
+	pageSize := m.currentPageSize()
+	start := (m.cursor / pageSize) * pageSize
+	if start < 0 {
+		start = 0
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
 	return start, end
+}
+
+func (m modelState) currentPageInfo(total int) (int, int) {
+	if total <= 0 {
+		return 1, 1
+	}
+	pageSize := m.currentPageSize()
+	totalPages := (total + pageSize - 1) / pageSize
+	page := (m.cursor / pageSize) + 1
+	if page < 1 {
+		page = 1
+	}
+	if page > totalPages {
+		page = totalPages
+	}
+	return page, totalPages
+}
+
+func (m modelState) moveCursorByPage(cursor int, delta int, total int) int {
+	if total <= 0 {
+		return 0
+	}
+	next := cursor + delta*m.currentPageSize()
+	if next < 0 {
+		next = 0
+	}
+	if next >= total {
+		next = total - 1
+	}
+	return next
 }

@@ -10,7 +10,7 @@
             if (n <= 1) return data;
             const half = n / 2, even = new Float32Array(half), odd = new Float32Array(half);
             for (let i = 0; i < half; i++) { even[i] = data[2 * i]; odd[i] = data[2 * i + 1]; }
-            const q = this.fft(even), r = this.fft(odd), output = new Float32Array(n); 
+            const q = this.fft(even), r = this.fft(odd), output = new Float32Array(n);
             for (let k = 0; k < half; k++) { const t = r[k]; output[k] = q[k] + t; output[k + half] = q[k] - t; }
             return output;
         },
@@ -23,17 +23,17 @@
             }
             for(let i=0; i<fftSize; i++) {
                 const val = (i < pcmData.length) ? pcmData[i] : 0;
-                this.windowed[i] = val * (0.5 * (1 - Math.cos(2 * Math.PI * i / (fftSize - 1)))); 
+                this.windowed[i] = val * (0.5 * (1 - Math.cos(2 * Math.PI * i / (fftSize - 1))));
             }
             const rawFFT = this.fft(this.windowed);
             for(let i=0; i<half; i++) {
                 let mag = Math.abs(rawFFT[i]) / fftSize;
-                mag = mag * 2.0; 
+                mag = mag * 2.0;
                 mag = smoothing * this.previousMags[i] + (1 - smoothing) * mag;
                 this.previousMags[i] = mag;
                 let db = 20 * Math.log10(mag + 1e-6);
                 const minDb = -100, maxDb = -10;
-                let val = (db - minDb) * (255 / (maxDb - minDb)); 
+                let val = (db - minDb) * (255 / (maxDb - minDb));
                 if(val < 0) val = 0; if(val > 255) val = 255;
                 this.mags[i] = val;
             }
@@ -78,6 +78,124 @@
     // 独立新窗口渲染线程 (Worker 环境)
     // =================================================================
     if (window.isRenderWorker) {
+        const fallbackLineDurationWorker = 1200;
+
+        function lyricProgressWorker(nowMs, start, end) {
+            if (nowMs <= start) return 0;
+            if (!Number.isFinite(end) || end <= start) return 1;
+            return Math.max(0, Math.min(1, (nowMs - start) / (end - start)));
+        }
+
+        function normalizeGroupWordsWorker(sourceWords, groupStart, groupEnd, fallbackText) {
+            const words = Array.isArray(sourceWords) && sourceWords.length > 0
+                ? sourceWords
+                : [{ text: fallbackText || '', start: groupStart, end: groupEnd }];
+            return words.map((word, index) => {
+                const start = Number(word?.start);
+                const nextStart = index + 1 < words.length ? Number(words[index + 1]?.start) : NaN;
+                let end = Number(word?.end);
+                const safeStart = Number.isFinite(start) ? start : groupStart;
+                if (!Number.isFinite(end) || end <= safeStart) {
+                    end = Number.isFinite(nextStart) && nextStart > safeStart ? nextStart : groupEnd;
+                }
+                return {
+                    text: String(word?.text || ''),
+                    start: safeStart,
+                    end
+                };
+            }).filter(word => word.text !== '');
+        }
+
+        function normalizeLyricGroupsWorker(rawGroups) {
+            return (rawGroups || []).map((group, index, list) => {
+                const start = Number(group?.start || 0);
+                const nextStart = index + 1 < list.length ? Number(list[index + 1]?.start || 0) : 0;
+                const end = nextStart > start ? nextStart : start + fallbackLineDurationWorker;
+                const lines = (group?.lines || []).map((line) => ({
+                    ...line,
+                    text: String(line?.text || ''),
+                    words: normalizeGroupWordsWorker(line?.words, start, end, line?.text)
+                }));
+                return { start, end, time: start / 1000, lines };
+            }).filter(group => group.lines.some(line => line.text));
+        }
+
+        function looksLikeRomajiLineWorker(line) {
+            const text = String(line?.text || '').trim();
+            if (!text) return false;
+            const latinCount = (text.match(/[A-Za-z]/g) || []).length;
+            const cjkOrKanaCount = (text.match(/[\u3040-\u30ff\u3400-\u9fff]/g) || []).length;
+            return latinCount > 0 && latinCount >= cjkOrKanaCount;
+        }
+
+        function splitLyricGroupLinesWorker(lines) {
+            const [orig, ...extras] = lines || [];
+            let roma = null;
+            let trans = null;
+            extras.forEach((line) => {
+                if (!roma && looksLikeRomajiLineWorker(line)) {
+                    roma = line;
+                    return;
+                }
+                if (!trans) {
+                    trans = line;
+                    return;
+                }
+                if (!roma) {
+                    roma = line;
+                }
+            });
+            return { orig, roma, trans };
+        }
+
+        function wrapPlainTextWorker(ctx, text, maxW) {
+            const lines = [];
+            let currentLine = '';
+            const chars = Array.from(String(text || ''));
+            for (let i = 0; i < chars.length; i++) {
+                const next = currentLine + chars[i];
+                if (ctx.measureText(next).width > maxW && currentLine.length > 0) {
+                    if (/[a-zA-Z]/.test(chars[i]) && currentLine.includes(' ')) {
+                        const lastSpace = currentLine.lastIndexOf(' ');
+                        lines.push(currentLine.substring(0, lastSpace));
+                        currentLine = currentLine.substring(lastSpace + 1) + chars[i];
+                    } else {
+                        lines.push(currentLine);
+                        currentLine = chars[i];
+                    }
+                } else {
+                    currentLine = next;
+                }
+            }
+            if (currentLine) lines.push(currentLine);
+            return lines;
+        }
+
+        function wrapWordSegmentsWorker(ctx, words, maxW) {
+            const lines = [];
+            let currentLine = [];
+            let currentWidth = 0;
+            words.forEach((word) => {
+                const width = ctx.measureText(word.text || '').width;
+                if (currentLine.length > 0 && currentWidth + width > maxW) {
+                    lines.push(currentLine);
+                    currentLine = [];
+                    currentWidth = 0;
+                }
+                currentLine.push(word);
+                currentWidth += width;
+            });
+            if (currentLine.length > 0) lines.push(currentLine);
+            return lines;
+        }
+
+        function createLineOnlyGroupsWorker(lyricRaw) {
+            return normalizeLyricGroupsWorker((lyricRaw || []).map((item) => ({
+                start: Math.round((Number(item?.time) || 0) * 1000),
+                lines: [{ text: String(item?.text || ''), words: [] }]
+            })));
+        }
+
         async function runOfflineRender(data) {
             const apiRoot = data.apiRoot;
             const statusText = document.getElementById("status-text");
@@ -93,40 +211,40 @@
 
             try {
                 let initRes;
-                // 新增：如果前端传来了自定义的音乐 Blob 文件，走 FormData 上传逻辑
+                let audioBuffer;
+                const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
                 if (data.customAudioFile) {
                     setStatus("正在初始化...", "正在向服务器投递您的本地音乐...", 5);
                     const fd = new FormData();
                     fd.append("id", data.id);
                     fd.append("source", data.source);
                     fd.append("audio_file", data.customAudioFile);
-                    
+
                     initRes = await fetch(`${apiRoot}/videogen/init`, {
                         method: "POST",
                         body: fd
                     }).then(r => r.json());
-                } else {
-                    // 原版逻辑：仅传 ID 让服务器自己下
-                    setStatus("正在初始化...", "请求云端处理通道", 5);
-                    initRes = await fetch(`${apiRoot}/videogen/init`, {
-                        method: "POST", headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ id: data.id, source: data.source }),
-                    }).then((r) => r.json());
-                }
-                
-                if (initRes.error) throw new Error(initRes.error);
-                
-                const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                let audioBuffer;
+                    if (initRes.error) throw new Error(initRes.error);
 
-                if (data.customAudioFile) {
                     setStatus("解码音频...", "解析本地高清音频数据...", 15);
                     const arr = await data.customAudioFile.arrayBuffer();
                     audioBuffer = await audioCtx.decodeAudioData(arr);
                 } else {
-                    setStatus("下载与解码音频...", "可能需要一些时间，请耐心等待", 15);
-                    const arr = await fetch(initRes.audio_url).then((r) => r.arrayBuffer());
-                    audioBuffer = await audioCtx.decodeAudioData(arr);
+                    setStatus("正在初始化...", "下载音频与初始化并行中...", 5);
+                    const audioDownloadUrl = `${apiRoot}/download?id=${encodeURIComponent(data.id)}&source=${encodeURIComponent(data.source)}`;
+                    const [initResult, audioArr] = await Promise.all([
+                        fetch(`${apiRoot}/videogen/init`, {
+                            method: "POST", headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ id: data.id, source: data.source }),
+                        }).then(r => r.json()),
+                        fetch(audioDownloadUrl).then(r => r.arrayBuffer())
+                    ]);
+                    initRes = initResult;
+                    if (initRes.error) throw new Error(initRes.error);
+
+                    setStatus("解码音频...", "解析音频数据...", 15);
+                    audioBuffer = await audioCtx.decodeAudioData(audioArr);
                 }
                     
                 setStatus("加载视觉资源...", "准备 1080P 超清渲染画板", 25);
@@ -163,15 +281,52 @@
                 const rawData = audioBuffer.getChannelData(0);
                 const samplesPerFrame = Math.floor(audioBuffer.sampleRate / fps);
                 const batchSize = 30; 
-                
+                const lyricGroups = Array.isArray(data.lyricGroups) && data.lyricGroups.length > 0
+                    ? normalizeLyricGroupsWorker(data.lyricGroups)
+                    : createLineOnlyGroupsWorker(data.lyricRaw);
+                const renderKaraoke = data.lyricMode === 'karaoke' && lyricGroups.length > 0;
+                 
                 FFT.reset();
                 setStatus("超清渲染中", "0%", 30);
                 
+                const canvasToJpegBlob = (targetCanvas, quality) => new Promise((resolve, reject) => {
+                    if (targetCanvas.toBlob) {
+                        targetCanvas.toBlob((blob) => {
+                            if (blob) resolve(blob);
+                            else reject(new Error("Frame encode failed"));
+                        }, "image/jpeg", quality);
+                        return;
+                    }
+
+                    try {
+                        const dataUrl = targetCanvas.toDataURL("image/jpeg", quality);
+                        const payload = dataUrl.split(",")[1] || "";
+                        const binary = atob(payload);
+                        const bytes = new Uint8Array(binary.length);
+                        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                        resolve(new Blob([bytes], { type: "image/jpeg" }));
+                    } catch (err) {
+                        reject(err);
+                    }
+                });
+
                 const uploadBatch = async (frames, startIdx) => {
-                    await fetch(`${apiRoot}/videogen/frame`, {
-                        method: "POST", headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ session_id: initRes.session_id, frames: frames, start_idx: startIdx })
+                    const form = new FormData();
+                    form.append("session_id", initRes.session_id);
+                    form.append("start_idx", String(startIdx));
+                    frames.forEach((blob, index) => {
+                        const frameNum = String(startIdx + index).padStart(5, "0");
+                        form.append("frames", blob, `frame_${frameNum}.jpg`);
                     });
+
+                    const res = await fetch(`${apiRoot}/videogen/frame`, {
+                        method: "POST",
+                        body: form
+                    });
+                    const body = await res.json().catch(() => ({}));
+                    if (!res.ok || body.error) {
+                        throw new Error(body.error || `Frame upload failed: ${res.status}`);
+                    }
                 };
                 
                 const seekVideo = async (time) => {
@@ -185,7 +340,317 @@
                         bgMedia.addEventListener('seeked', onSeeked);
                     });
                 };
-                
+
+                const drawWrappedLines = (lines, x, startY, lineHeight, color, alpha) => {
+                    ctx.fillStyle = color;
+                    let y = startY + lineHeight / 2;
+                    for (const lineText of lines) {
+                        ctx.globalAlpha = alpha;
+                        ctx.fillText(lineText, x, y);
+                        y += lineHeight;
+                    }
+                    ctx.globalAlpha = 1;
+                    return startY + (lines.length * lineHeight);
+                };
+
+                const karaokeTextColor = "#ffffff";
+                const karaokeAccentColor = "#12bd85";
+                const karaokeStrokeText = (text, x, y, lineHeight, fillColor, strokeColor, alpha) => {
+                    ctx.save();
+                    ctx.globalAlpha = alpha;
+                    ctx.lineJoin = "round";
+                    ctx.lineWidth = Math.max(2, lineHeight * 0.08);
+                    ctx.strokeStyle = strokeColor;
+                    ctx.fillStyle = fillColor;
+                    ctx.strokeText(text, x, y);
+                    ctx.fillText(text, x, y);
+                    ctx.restore();
+                };
+
+                const drawKaraokeWordLine = (words, x, y, lineHeight, nowMs, baseColor, fillColor, alpha) => {
+                    ctx.lineJoin = "round"; // 确保边缘绝对圆润无尖刺
+                    ctx.lineWidth = Math.max(3, lineHeight * 0.12); // 稍微加粗，还原图1厚实感
+                    ctx.globalAlpha = alpha;
+                    const strokeSpill = ctx.lineWidth; // 计算边框向外溢出的安全区距离
+
+                    let cursorX = x;
+                    
+                    // 第1层：先画一整句的【底层绿边】
+                    ctx.strokeStyle = karaokeAccentColor;
+                    words.forEach((word) => {
+                        const text = String(word?.text || '');
+                        if (text) { ctx.strokeText(text, cursorX, y); cursorX += ctx.measureText(text).width; }
+                    });
+
+                    // 第2层：再画一整句的【底层白字】（字压在边上，内部绝对纯净无色块）
+                    cursorX = x;
+                    ctx.fillStyle = baseColor;
+                    words.forEach((word) => {
+                        const text = String(word?.text || '');
+                        if (text) { ctx.fillText(text, cursorX, y); cursorX += ctx.measureText(text).width; }
+                    });
+
+                    // 高级裁剪层：精确切出当前的进度光束
+                    ctx.save();
+                    ctx.beginPath();
+                    cursorX = x;
+                    words.forEach((word) => {
+                        const text = String(word?.text || '');
+                        if (!text) return;
+                        const width = ctx.measureText(text).width;
+                        const progress = lyricProgressWorker(nowMs, Number(word.start || 0), Number(word.end || 0));
+                        
+                        if (progress > 0) {
+                            // 核心修复：100%时刻意放宽右侧裁剪区，且向左延伸防止切掉首字描边
+                            const clipRight = progress === 1 ? width + strokeSpill : width * progress;
+                            ctx.rect(cursorX - strokeSpill, y - lineHeight, strokeSpill + clipRight, lineHeight * 2);
+                        }
+                        cursorX += width;
+                    });
+                    ctx.clip();
+
+                    // 第3层：在进度裁剪区内画【高亮白边】
+                    cursorX = x;
+                    ctx.strokeStyle = karaokeTextColor;
+                    words.forEach((word) => {
+                        const text = String(word?.text || '');
+                        if (text) { ctx.strokeText(text, cursorX, y); cursorX += ctx.measureText(text).width; }
+                    });
+
+                    // 第4层：在进度裁剪区内画【高亮绿字】
+                    cursorX = x;
+                    ctx.fillStyle = fillColor;
+                    words.forEach((word) => {
+                        const text = String(word?.text || '');
+                        if (text) { ctx.fillText(text, cursorX, y); cursorX += ctx.measureText(text).width; }
+                    });
+
+                    ctx.restore();
+                    ctx.globalAlpha = 1;
+                };
+
+                const drawLineLyrics = (time, lx, baseLy, maxWidth, gap) => {
+                    let activeIdx = -1;
+                    for (let i = 0; i < data.lyricRaw.length; i++) {
+                        if (time >= data.lyricRaw[i].time) activeIdx = i;
+                        else break;
+                    }
+                    if (activeIdx === -1) return;
+
+                    let lyricsBlocks = [];
+                    let activeBlockIndex = -1;
+                    for (let offset = -4; offset <= 4; offset++) {
+                        const idx = activeIdx + offset;
+                        if (idx >= 0 && idx < data.lyricRaw.length) {
+                            const isCurrent = offset === 0;
+                            ctx.font = isCurrent ? "bold 36px sans-serif" : "600 26px sans-serif";
+                            const lineHeight = isCurrent ? 48 : 34;
+                            const textLines = wrapPlainTextWorker(ctx, data.lyricRaw[idx].text, maxWidth);
+                            const blockHeight = (textLines.length - 1) * lineHeight;
+
+                            lyricsBlocks.push({
+                                textLines,
+                                isCurrent,
+                                lineHeight,
+                                blockHeight,
+                                font: ctx.font,
+                                color: isCurrent ? "#ffffff" : "rgba(255,255,255,0.85)",
+                                shadowBlur: isCurrent ? 6 : 4,
+                                shadowOffset: isCurrent ? 2 : 1
+                            });
+                            if (isCurrent) activeBlockIndex = lyricsBlocks.length - 1;
+                        }
+                    }
+
+                    if (activeBlockIndex === -1) return;
+                    const activeBlock = lyricsBlocks[activeBlockIndex];
+                    activeBlock.startY = baseLy - (activeBlock.blockHeight / 2);
+                    for (let i = activeBlockIndex + 1; i < lyricsBlocks.length; i++) {
+                        const prev = lyricsBlocks[i - 1];
+                        lyricsBlocks[i].startY = prev.startY + prev.blockHeight + gap + (prev.lineHeight / 2) + (lyricsBlocks[i].lineHeight / 2);
+                    }
+                    for (let i = activeBlockIndex - 1; i >= 0; i--) {
+                        const next = lyricsBlocks[i + 1];
+                        lyricsBlocks[i].startY = next.startY - lyricsBlocks[i].blockHeight - gap - (next.lineHeight / 2) - (lyricsBlocks[i].lineHeight / 2);
+                    }
+
+                    for (const block of lyricsBlocks) {
+                        ctx.font = block.font;
+                        ctx.fillStyle = block.color;
+                        ctx.shadowColor = "rgba(0,0,0,0.9)";
+                        ctx.shadowBlur = block.shadowBlur;
+                        ctx.shadowOffsetX = block.shadowOffset;
+                        ctx.shadowOffsetY = block.shadowOffset;
+                        let lineY = block.startY;
+                        for (const lineText of block.textLines) {
+                            let alpha = 1;
+                            const dist = Math.abs(lineY - baseLy);
+                            if (dist > 230) alpha = Math.max(0, 1 - (dist - 230) / 70);
+                            if (alpha > 0) {
+                                ctx.globalAlpha = alpha;
+                                ctx.fillText(lineText, lx, lineY);
+                                ctx.globalAlpha = 1;
+                            }
+                            lineY += block.lineHeight;
+                        }
+                    }
+                };
+
+                const drawKaraokeLyrics = (timeMs, lx, baseLy, maxWidth) => {
+                    const karaokeFillColor = karaokeAccentColor;
+                    const createLineLayout = (line, font, lineHeight, useWordProgress) => {
+                        if (!line?.text) {
+                            return { useWordProgress: false, wordLines: [], textLines: [], lineHeight, height: 0 };
+                        }
+                        ctx.font = font;
+                        if (useWordProgress && Array.isArray(line.words) && line.words.length > 0) {
+                            const wordLines = wrapWordSegmentsWorker(ctx, line.words, maxWidth);
+                            const textLines = wordLines.map((lineWords) => lineWords.map((word) => word.text).join(''));
+                            return {
+                                useWordProgress: true,
+                                wordLines,
+                                textLines,
+                                lineHeight,
+                                height: textLines.length * lineHeight
+                            };
+                        }
+                        const textLines = wrapPlainTextWorker(ctx, line.text, maxWidth);
+                        return {
+                            useWordProgress: false,
+                            wordLines: [],
+                            textLines,
+                            lineHeight,
+                            height: textLines.length * lineHeight
+                        };
+                    };
+                    const drawLineLayout = (layout, x, startY, font, now, baseColor, alpha, isCurrent) => {
+                        if (!layout || layout.textLines.length === 0) return startY;
+                        ctx.font = font;
+                        if (layout.useWordProgress && isCurrent) {
+                            layout.wordLines.forEach((lineWords, lineIndex) => {
+                                const y = startY + (lineIndex * layout.lineHeight) + layout.lineHeight / 2;
+                                drawKaraokeWordLine(lineWords, x, y, layout.lineHeight, now, baseColor, karaokeFillColor, alpha);
+                            });
+                        } else {
+                            layout.textLines.forEach((lineText, lineIndex) => {
+                                const y = startY + (lineIndex * layout.lineHeight) + layout.lineHeight / 2;
+                                karaokeStrokeText(lineText, x, y, layout.lineHeight, baseColor, karaokeAccentColor, alpha);
+                            });
+                        }
+                        return startY + layout.height;
+                    };
+                    let activeIdx = -1;
+                    for (let i = 0; i < lyricGroups.length; i++) {
+                        if (timeMs >= lyricGroups[i].start) activeIdx = i;
+                        else break;
+                    }
+                    if (activeIdx === -1) return;
+
+                    const blocks = [];
+                    let currentBlockIndex = -1;
+                    for (let offset = -2; offset <= 2; offset++) {
+                        const idx = activeIdx + offset;
+                        if (idx < 0 || idx >= lyricGroups.length) continue;
+
+                        const group = lyricGroups[idx];
+                        const { orig, roma, trans } = splitLyricGroupLinesWorker(group.lines);
+                        if (!orig) continue;
+
+                        const isCurrent = offset === 0;
+                        const blockAlpha = isCurrent ? 1 : 0.72;
+                        const origFont = isCurrent ? "bold 40px sans-serif" : "700 28px sans-serif";
+                        const origLineHeight = isCurrent ? 52 : 38;
+                        const subGap = isCurrent ? 10 : 8;
+                        const transFont = isCurrent ? "600 24px sans-serif" : "500 18px sans-serif";
+                        const transLineHeight = isCurrent ? 30 : 22;
+                        const romaFont = isCurrent ? "500 20px sans-serif" : "500 16px sans-serif";
+                        const romaLineHeight = isCurrent ? 26 : 20;
+
+                        const origLayout = createLineLayout(orig, origFont, origLineHeight, true);
+                        const romaLayout = createLineLayout(roma, romaFont, romaLineHeight, !!roma?.verbatim);
+                        const transLayout = createLineLayout(trans, transFont, transLineHeight, !!trans?.verbatim);
+
+                        const blockHeight =
+                            origLayout.height +
+                            (romaLayout.height > 0 ? (subGap + romaLayout.height) : 0) +
+                            (transLayout.height > 0 ? (subGap + transLayout.height) : 0);
+
+                        blocks.push({
+                            isCurrent,
+                            alpha: blockAlpha,
+                            origFont,
+                            origLayout,
+                            transFont,
+                            transLayout,
+                            romaFont,
+                            romaLayout,
+                            blockHeight,
+                            subGap
+                        });
+                        if (isCurrent) currentBlockIndex = blocks.length - 1;
+                    }
+
+                    if (currentBlockIndex === -1) return;
+                    const blockGap = 28;
+                    blocks[currentBlockIndex].topY = baseLy - (blocks[currentBlockIndex].blockHeight / 2);
+                    for (let i = currentBlockIndex + 1; i < blocks.length; i++) {
+                        const prev = blocks[i - 1];
+                        blocks[i].topY = prev.topY + prev.blockHeight + blockGap;
+                    }
+                    for (let i = currentBlockIndex - 1; i >= 0; i--) {
+                        const next = blocks[i + 1];
+                        blocks[i].topY = next.topY - blocks[i].blockHeight - blockGap;
+                    }
+
+                    blocks.forEach((block) => {
+                        ctx.shadowColor = "rgba(0,0,0,0.9)";
+                        ctx.shadowBlur = block.isCurrent ? 8 : 6;
+                        ctx.shadowOffsetX = 2;
+                        ctx.shadowOffsetY = 2;
+
+                        let currentY = block.topY;
+
+                        currentY = drawLineLayout(
+                            block.origLayout,
+                            lx,
+                            currentY,
+                            block.origFont,
+                            timeMs,
+                            karaokeTextColor,
+                            block.alpha,
+                            block.isCurrent
+                        );
+
+                        if (block.romaLayout.height > 0) {
+                            currentY += block.subGap;
+                            currentY = drawLineLayout(
+                                block.romaLayout,
+                                lx,
+                                currentY,
+                                block.romaFont,
+                                timeMs,
+                                karaokeTextColor,
+                                block.alpha,
+                                block.isCurrent
+                            );
+                        }
+
+                        if (block.transLayout.height > 0) {
+                            currentY += block.subGap;
+                            drawLineLayout(
+                                block.transLayout,
+                                lx,
+                                currentY,
+                                block.transFont,
+                                timeMs,
+                                karaokeTextColor,
+                                block.alpha,
+                                block.isCurrent
+                            );
+                        }
+                    });
+                };
+                 
                 const drawFrame = async (frameIdx) => {
                     const time = frameIdx / fps;
                     if (data.isVideoBg) await seekVideo(time);
@@ -193,7 +658,7 @@
                     const fftSize = 2048; 
                     const startSample = Math.max(0, Math.floor((frameIdx * samplesPerFrame) - (fftSize / 4))); 
                     
-                    let pcmSlice = rawData.slice(startSample, startSample + fftSize);
+                    let pcmSlice = rawData.subarray(startSample, startSample + fftSize);
                     if (pcmSlice.length < fftSize) {
                         const padded = new Float32Array(fftSize);
                         padded.set(pcmSlice); pcmSlice = padded;
@@ -237,71 +702,11 @@
                     ctx.drawImage(bgMedia, 0, 0, mw, mh, -coverRadius, -coverRadius, coverRadius * 2, coverRadius * 2); ctx.restore();
                     ctx.restore(); 
           
-                    const lx = 600, baseLy = logicalH / 2, maxWidth = logicalW - lx - 40, gap = 20; 
-                    let activeIdx = -1;
-                    for (let i = 0; i < data.lyricRaw.length; i++) { if (time >= data.lyricRaw[i].time) activeIdx = i; else break; }
-
-                    ctx.textAlign = "left"; ctx.textBaseline = "middle";
-                    const wrapText = (text, maxW) => {
-                        const lines = []; let currentLine = ''; const chars = Array.from(text);
-                        for (let i = 0; i < chars.length; i++) {
-                            let testLine = currentLine + chars[i];
-                            if (ctx.measureText(testLine).width > maxW && currentLine.length > 0) {
-                                if (/[a-zA-Z]/.test(chars[i]) && currentLine.includes(' ')) {
-                                    let lastSpace = currentLine.lastIndexOf(' ');
-                                    lines.push(currentLine.substring(0, lastSpace));
-                                    currentLine = currentLine.substring(lastSpace + 1) + chars[i];
-                                } else { lines.push(currentLine); currentLine = chars[i]; }
-                            } else { currentLine = testLine; }
-                        }
-                        if (currentLine) lines.push(currentLine);
-                        return lines;
-                    };
-
-                    let lyricsBlocks = []; let activeBlockIndex = -1;
-                    for (let offset = -4; offset <= 4; offset++) {
-                        const idx = activeIdx + offset;
-                        if (idx >= 0 && idx < data.lyricRaw.length) {
-                            const isCurrent = offset === 0;
-                            ctx.font = isCurrent ? "bold 36px sans-serif" : "600 26px sans-serif";
-                            const lineHeight = isCurrent ? 48 : 34;
-                            const textLines = wrapText(data.lyricRaw[idx].text, maxWidth);
-                            const blockHeight = (textLines.length - 1) * lineHeight; 
-                            
-                            lyricsBlocks.push({
-                                offset, textLines, isCurrent, lineHeight, blockHeight,
-                                font: ctx.font, color: isCurrent ? "#fff" : "rgba(255,255,255,0.85)",
-                                shadowBlur: isCurrent ? 6 : 4, shadowOffset: isCurrent ? 2 : 1
-                            });
-                            if (isCurrent) activeBlockIndex = lyricsBlocks.length - 1;
-                        }
-                    }
-
-                    if (activeBlockIndex !== -1) {
-                        const activeBlock = lyricsBlocks[activeBlockIndex];
-                        activeBlock.startY = baseLy - (activeBlock.blockHeight / 2);
-                        for (let i = activeBlockIndex + 1; i < lyricsBlocks.length; i++) {
-                            const prev = lyricsBlocks[i-1];
-                            lyricsBlocks[i].startY = prev.startY + prev.blockHeight + gap + (prev.lineHeight / 2) + (lyricsBlocks[i].lineHeight / 2);
-                        }
-                        for (let i = activeBlockIndex - 1; i >= 0; i--) {
-                            const next = lyricsBlocks[i+1];
-                            lyricsBlocks[i].startY = next.startY - lyricsBlocks[i].blockHeight - gap - (next.lineHeight / 2) - (lyricsBlocks[i].lineHeight / 2);
-                        }
-                        for (let block of lyricsBlocks) {
-                            ctx.font = block.font; ctx.fillStyle = block.color;
-                            ctx.shadowColor = "rgba(0,0,0,0.9)"; ctx.shadowBlur = block.shadowBlur;
-                            ctx.shadowOffsetX = block.shadowOffset; ctx.shadowOffsetY = block.shadowOffset;
-                            let lineY = block.startY;
-                            for (let lineText of block.textLines) {
-                                let alpha = 1;
-                                const dist = Math.abs(lineY - baseLy);
-                                if (dist > 230) alpha = Math.max(0, 1 - (dist - 230) / 70); 
-                                if (alpha > 0) { ctx.globalAlpha = alpha; ctx.fillText(lineText, lx, lineY); ctx.globalAlpha = 1.0; }
-                                lineY += block.lineHeight;
-                            }
-                        }
-                    }
+                    const lx = 600, baseLy = logicalH / 2, maxWidth = logicalW - lx - 40, gap = 20;
+                    ctx.textAlign = "left";
+                    ctx.textBaseline = "middle";
+                    if (renderKaraoke) drawKaraokeLyrics(time * 1000, lx, baseLy, maxWidth);
+                    else drawLineLyrics(time, lx, baseLy, maxWidth, gap);
                     
                     ctx.font = "bold 26px sans-serif"; ctx.fillStyle = "#fff"; ctx.textAlign = "center";
                     ctx.shadowColor = "rgba(0,0,0,0.9)"; ctx.shadowBlur = 8;
@@ -311,24 +716,34 @@
                     
                     ctx.restore(); 
                     
-                    previewCtx.clearRect(0,0,width,height);
-                    previewCtx.drawImage(canvas, 0, 0);
+                    if (frameIdx % 10 === 0 || frameIdx === totalFrames - 1) {
+                        previewCtx.clearRect(0,0,width,height);
+                        previewCtx.drawImage(canvas, 0, 0);
+                    }
                 };
                 
                 let frameIdx = 0;
+                let uploadPromise = Promise.resolve();
+                const renderStartTime = performance.now();
                 while (frameIdx < totalFrames) {
                   let framesBuffer = [];
                   const batchStartIdx = frameIdx;
                   for (let i = 0; i < batchSize && frameIdx < totalFrames; i++) {
                     await drawFrame(frameIdx);
-                    framesBuffer.push(canvas.toDataURL("image/jpeg", 0.95));
+                    framesBuffer.push(await canvasToJpegBlob(canvas, 0.92));
                     frameIdx++;
                   }
-                  await uploadBatch(framesBuffer, batchStartIdx);
+                  await uploadPromise;
+                  uploadPromise = uploadBatch(framesBuffer, batchStartIdx);
                   const pct = Math.round((frameIdx / totalFrames) * 100);
-                  setStatus("超清帧渲染中...", `已完成 ${pct}%  (${frameIdx}/${totalFrames} 帧)`, 30 + pct * 0.65);
-                  await new Promise(r => setTimeout(r, 0));
+                  const elapsed = (performance.now() - renderStartTime) / 1000;
+                  const eta = frameIdx > 0 ? Math.round(elapsed / frameIdx * (totalFrames - frameIdx)) : 0;
+                  const etaMin = Math.floor(eta / 60);
+                  const etaSec = eta % 60;
+                  const etaStr = etaMin > 0 ? `${etaMin}分${etaSec}秒` : `${etaSec}秒`;
+                  setStatus("超清帧渲染中...", `已完成 ${pct}%  (${frameIdx}/${totalFrames} 帧)  预计剩余 ${etaStr}`, 30 + pct * 0.65);
                 }
+                await uploadPromise;
                 
                 setStatus("正在合成最终视频...", "合并无损音频与画面帧", 98);
                 const finalRes = await fetch(`${apiRoot}/videogen/finish`, {
@@ -358,11 +773,251 @@
     // =================================================================
     // 网页主播放界面
     // =================================================================
+    const lyricTimeRe = /\[(\d+):(\d+)\.(\d{1,3})\]/g;
+    const fallbackLineDuration = 1200;
+
+    function escapeHTML(value) {
+        return String(value ?? '').replace(/[&<>"']/g, (char) => {
+            switch (char) {
+            case '&':
+                return '&amp;';
+            case '<':
+                return '&lt;';
+            case '>':
+                return '&gt;';
+            case '"':
+                return '&quot;';
+            case '\'':
+                return '&#39;';
+            default:
+                return char;
+            }
+        });
+    }
+
+    function lyricTimeToMs(parts) {
+        const minute = Number(parts[1]) || 0;
+        const second = Number(parts[2]) || 0;
+        let ms = String(parts[3] || '0');
+        if (ms.length === 1) ms += '00';
+        if (ms.length === 2) ms += '0';
+        return minute * 60000 + second * 1000 + Number(ms.slice(0, 3));
+    }
+
+    function lyricProgress(nowMs, start, end) {
+        if (nowMs <= start) return 0;
+        if (!Number.isFinite(end) || end <= start) return 1;
+        return Math.max(0, Math.min(1, (nowMs - start) / (end - start)));
+    }
+
+    function parseLyricLine(line) {
+        lyricTimeRe.lastIndex = 0;
+        const matches = Array.from(String(line || '').matchAll(lyricTimeRe));
+        if (matches.length === 0) return null;
+
+        const start = lyricTimeToMs(matches[0]);
+        const words = [];
+        for (let i = 0; i < matches.length; i++) {
+            const textStart = matches[i].index + matches[i][0].length;
+            const textEnd = i + 1 < matches.length ? matches[i + 1].index : line.length;
+            const text = line.slice(textStart, textEnd);
+            if (!text) continue;
+            words.push({
+                start: lyricTimeToMs(matches[i]),
+                end: i + 1 < matches.length ? lyricTimeToMs(matches[i + 1]) : null,
+                text
+            });
+        }
+
+        const text = line.replace(lyricTimeRe, '').trim();
+        return { start, time: start / 1000, words, text, verbatim: matches.length > 1 };
+    }
+
+    function normalizeGroupWords(sourceWords, groupStart, groupEnd, fallbackText) {
+        const words = Array.isArray(sourceWords) && sourceWords.length > 0
+            ? sourceWords
+            : [{ text: fallbackText || '', start: groupStart, end: groupEnd }];
+        return words
+            .map((word, index) => {
+                const start = Number(word?.start);
+                const nextStart = index + 1 < words.length ? Number(words[index + 1]?.start) : NaN;
+                let end = Number(word?.end);
+                const safeStart = Number.isFinite(start) ? start : groupStart;
+                if (!Number.isFinite(end) || end <= safeStart) {
+                    end = Number.isFinite(nextStart) && nextStart > safeStart ? nextStart : groupEnd;
+                }
+                return {
+                    text: String(word?.text || ''),
+                    start: safeStart,
+                    end
+                };
+            })
+            .filter(word => word.text !== '');
+    }
+
+    function normalizeLyricGroups(rawGroups) {
+        return (rawGroups || []).map((group, index, list) => {
+            const start = Number(group?.start || 0);
+            const nextStart = index + 1 < list.length ? Number(list[index + 1]?.start || 0) : 0;
+            const end = nextStart > start ? nextStart : start + fallbackLineDuration;
+            const lines = (group?.lines || []).map((line) => ({
+                ...line,
+                text: String(line?.text || ''),
+                words: normalizeGroupWords(line?.words, start, end, line?.text)
+            }));
+            return {
+                start,
+                end,
+                time: start / 1000,
+                lines
+            };
+        }).filter(group => group.lines.some(line => line.text));
+    }
+
+    function looksLikeRomajiLine(line) {
+        const text = String(line?.text || '').trim();
+        if (!text) return false;
+        const latinCount = (text.match(/[A-Za-z]/g) || []).length;
+        const cjkOrKanaCount = (text.match(/[\u3040-\u30ff\u3400-\u9fff]/g) || []).length;
+        return latinCount > 0 && latinCount >= cjkOrKanaCount;
+    }
+
+    function splitLyricGroupLines(lines) {
+        const [orig, ...extras] = lines || [];
+        let roma = null;
+        let trans = null;
+        extras.forEach((line) => {
+            if (!roma && looksLikeRomajiLine(line)) {
+                roma = line;
+                return;
+            }
+            if (!trans) {
+                trans = line;
+                return;
+            }
+            if (!roma) {
+                roma = line;
+            }
+        });
+        return { orig, roma, trans };
+    }
+
+    function wrapPlainText(ctx, text, maxW) {
+        const lines = [];
+        let currentLine = '';
+        const chars = Array.from(String(text || ''));
+        for (let i = 0; i < chars.length; i++) {
+            const next = currentLine + chars[i];
+            if (ctx.measureText(next).width > maxW && currentLine.length > 0) {
+                if (/[a-zA-Z]/.test(chars[i]) && currentLine.includes(' ')) {
+                    const lastSpace = currentLine.lastIndexOf(' ');
+                    lines.push(currentLine.substring(0, lastSpace));
+                    currentLine = currentLine.substring(lastSpace + 1) + chars[i];
+                } else {
+                    lines.push(currentLine);
+                    currentLine = chars[i];
+                }
+            } else {
+                currentLine = next;
+            }
+        }
+        if (currentLine) lines.push(currentLine);
+        return lines;
+    }
+
+    function wrapWordSegments(ctx, words, maxW) {
+        const lines = [];
+        let currentLine = [];
+        let currentWidth = 0;
+        words.forEach((word) => {
+            const width = ctx.measureText(word.text || '').width;
+            if (currentLine.length > 0 && currentWidth + width > maxW) {
+                lines.push(currentLine);
+                currentLine = [];
+                currentWidth = 0;
+            }
+            currentLine.push(word);
+            currentWidth += width;
+        });
+        if (currentLine.length > 0) lines.push(currentLine);
+        return lines;
+    }
+
+    function createLineOnlyGroups(lyricRaw) {
+        return normalizeLyricGroups((lyricRaw || []).map((item) => ({
+            start: Math.round((Number(item?.time) || 0) * 1000),
+            lines: [{ text: String(item?.text || ''), words: [] }]
+        })));
+    }
+
+    function parseLyrics(raw) {
+        const map = new Map();
+        let hasVerbatim = false;
+        String(raw || '').split(/\r?\n/).forEach((rawLine) => {
+            const line = rawLine.trim();
+            if (!line || /^\[[A-Za-z]+:[^\]]*\]$/.test(line)) return;
+            const parsed = parseLyricLine(line);
+            if (!parsed || !parsed.text) return;
+            hasVerbatim = hasVerbatim || parsed.verbatim;
+            if (!map.has(parsed.start)) {
+                map.set(parsed.start, { start: parsed.start, time: parsed.time, lines: [] });
+            }
+            map.get(parsed.start).lines.push(parsed);
+        });
+
+        const groups = normalizeLyricGroups(Array.from(map.values()).sort((a, b) => a.start - b.start));
+        const hasMultiLang = groups.some(group => group.lines.length > 1);
+        return {
+            type: hasVerbatim || hasMultiLang ? 'karaoke' : 'line',
+            groups
+        };
+    }
+
+    function renderKaraokeWordsHTML(words, fallbackStart, fallbackEnd) {
+        return (words || []).map((word) => [
+            `<span class="vg-word" data-start="${word.start || fallbackStart}" data-end="${word.end || fallbackEnd}" style="--karaoke-progress:0%;">`,
+            `<span class="vg-word-base">${escapeHTML(word.text)}</span>`,
+            `<span class="vg-word-fill">${escapeHTML(word.text)}</span>`,
+            '</span>'
+        ].join('')).join('');
+    }
+
+    function renderKaraokeLineHTML(line, className, group, useWordProgress) {
+        if (!line?.text) return '';
+        const content = useWordProgress && Array.isArray(line.words) && line.words.length > 0
+            ? renderKaraokeWordsHTML(line.words, group.start, group.end)
+            : escapeHTML(line.text);
+        return `<div class="${className}">${content}</div>`;
+    }
+
+    function buildVideoGenLyricURL(songData) {
+        if (window.buildLyricRequestURL) {
+            return window.buildLyricRequestURL(songData, 'lyric', 'auto');
+        }
+
+        const params = new URLSearchParams({
+            id: String(songData?.id || ''),
+            source: String(songData?.source || ''),
+            name: String(songData?.name || ''),
+            artist: String(songData?.artist || ''),
+            album: String(songData?.album || ''),
+            duration: String(songData?.duration || 0),
+            format: 'auto'
+        });
+        const extra = typeof songData?.extra === 'string'
+            ? songData.extra
+            : JSON.stringify(songData?.extra || {});
+        if (extra && extra !== '{}' && extra !== 'null') {
+            params.set('extra', extra);
+        }
+        return `${window.API_ROOT}/lyric?${params.toString()}`;
+    }
+
     window.VideoGen = {
-      data: null, customVisual: null, lyricTimes: [], lyricRaw: [], lastActiveIndex: -1,
+      data: null, customVisual: null, lyricTimes: [], lyricRaw: [], lyricGroups: [], lyricMode: 'line', lastActiveIndex: -1,
       audioCtx: null, analyser: null, sourceNode: null, localSourceNode: null, 
       isPlaying: false, rtCanvas: null, rtCtx: null, animationId: null, isVideoBg: false,
-      resizeObserver: null, isDraggingProgress: false,
+      resizeObserver: null, isDraggingProgress: false, lyricsAnimationId: null,
       
       // 本地音频支持
       isLocalAudio: false, localAudio: null, _currentAudioEl: null, _currentLocalAudioFile: null,
@@ -407,6 +1062,63 @@
               vb.value = targetVol * 100;
               this.setVolume(targetVol);
           }
+      },
+
+      playbackRate: 1,
+      getCurrentPlaybackRate: function() {
+          if (typeof window.getPlayerPlaybackRate === 'function') {
+              const shared = Number(window.getPlayerPlaybackRate());
+              if (Number.isFinite(shared) && shared > 0) return shared;
+          }
+          return Number(this.playbackRate) || 1;
+      },
+      toggleSpeedMenu: function(event) {
+          if (event) event.stopPropagation();
+          const menu = document.getElementById('vg-speed-menu');
+          if (!menu) return;
+          menu.hidden = !menu.hidden;
+      },
+      setPlaybackRate: function(rate) {
+          const allowed = Array.isArray(window.PLAYER_SPEEDS) && window.PLAYER_SPEEDS.length
+              ? window.PLAYER_SPEEDS
+              : [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 2.75, 3];
+          const normalized = allowed.includes(Number(rate)) ? Number(rate) : 1;
+          this.playbackRate = normalized;
+          if (typeof window.setPlayerPlaybackRate === 'function') {
+              window.setPlayerPlaybackRate(normalized);
+          } else {
+              const audio = this.isLocalAudio ? this.localAudio : (window.ap && window.ap.audio);
+              if (audio) audio.playbackRate = normalized;
+          }
+          if (this.localAudio) this.localAudio.playbackRate = normalized;
+          const audio = this.isLocalAudio ? this.localAudio : (window.ap && window.ap.audio);
+          if (audio) audio.playbackRate = normalized;
+          const button = document.getElementById('vg-speed-button');
+          if (button) button.textContent = `${this.playbackRate}x`;
+          document.querySelectorAll('#vg-speed-menu .vg-speed-option').forEach((option) => {
+              option.classList.toggle('active', Number(option.dataset.rate) === this.playbackRate);
+          });
+          const menu = document.getElementById('vg-speed-menu');
+          if (menu) menu.hidden = true;
+      },
+      initSpeedControl: function() {
+          const menu = document.getElementById('vg-speed-menu');
+          if (!menu || menu.dataset.initialized === '1') return;
+          const allowed = Array.isArray(window.PLAYER_SPEEDS) && window.PLAYER_SPEEDS.length
+              ? window.PLAYER_SPEEDS
+              : [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 2.75, 3];
+          const current = Number(this.getCurrentPlaybackRate());
+          this.playbackRate = allowed.includes(current) ? current : 1;
+          menu.innerHTML = allowed.map((rate) =>
+              `<button type="button" class="vg-speed-option" data-rate="${rate}">${rate}x</button>`
+          ).join('');
+          menu.addEventListener('click', (event) => {
+              const option = event.target.closest('.vg-speed-option');
+              if (option) this.setPlaybackRate(option.dataset.rate);
+          });
+          document.addEventListener('click', () => { menu.hidden = true; });
+          menu.dataset.initialized = '1';
+          this.setPlaybackRate(this.playbackRate);
       },
 
       handleFileSelect: function (input) {
@@ -477,18 +1189,18 @@
             this.apTimeHandler = () => this.syncLyrics();
             this.apPlayHandler = () => { 
                 if (!this.isLocalAudio && window.currentPlayingId !== this.data.id) return;
-                this.isPlaying = true; this.updatePlayUI(); this.initAudioContext(); this.startRealtimeVisualizer(); 
+                this.isPlaying = true; this.updatePlayUI(); this.initAudioContext(); this.startRealtimeVisualizer(); this.startLyricsLoop();
                 const b = document.getElementById("vg-bg-video"), c = document.getElementById("vg-cover-video");
                 if(b?.style.display !== 'none') b.play().catch(()=>{}); if(c?.style.display !== 'none') c.play().catch(()=>{});
                 document.getElementById("vg-bg-img")?.classList.add("playing");
             };
             this.apPauseHandler = () => { 
-                this.isPlaying = false; this.updatePlayUI(); this.stopRealtimeVisualizer(); 
+                this.isPlaying = false; this.updatePlayUI(); this.stopRealtimeVisualizer(); this.stopLyricsLoop(); this.syncLyrics();
                 const b = document.getElementById("vg-bg-video"), c = document.getElementById("vg-cover-video");
                 if(b?.style.display !== 'none') b.pause(); if(c?.style.display !== 'none') c.pause();
                 document.getElementById("vg-bg-img")?.classList.remove("playing");
             };
-            this.apEndHandler = () => { this.isPlaying = false; this.updatePlayUI(); this.stopRealtimeVisualizer(); };
+            this.apEndHandler = () => { this.isPlaying = false; this.updatePlayUI(); this.stopRealtimeVisualizer(); this.stopLyricsLoop(); this.syncLyrics(); };
         }
 
         audioEl.addEventListener('timeupdate', this.apTimeHandler);
@@ -507,6 +1219,7 @@
 
       open: async function (songData) {
         this.data = songData; this.customVisual = null;
+        this.initSpeedControl();
         this.isLocalAudio = false; this._currentLocalAudioFile = null;
         if(this.localAudio) { this.localAudio.pause(); this.localAudio.removeAttribute('src'); this.localAudio.load(); }
 
@@ -520,6 +1233,7 @@
             this.updatePlayUI();
             this.attachEvents(window.ap.audio);
         }
+        this.setPlaybackRate(this.playbackRate);
         
         const sb = document.getElementById('vg-seek-bar');
         sb.oninput = (e) => {
@@ -574,11 +1288,12 @@
 
         this.reset(); 
         
-        fetch(`${window.API_ROOT}/lyric?id=${encodeURIComponent(songData.id)}&source=${songData.source}`)
+        fetch(buildVideoGenLyricURL(songData))
             .then(r => r.text())
             .then(text => this.parseAndSetLyrics(text));
 
         modal.style.display = "flex";
+        document.body.classList.add("vg-open");
         requestAnimationFrame(() => { 
             modal.classList.add("active"); this.initRealtimeCanvas(); 
             if (this.isPlaying) this.apPlayHandler(); 
@@ -587,14 +1302,17 @@
 
       close: function () {
         this.stopRealtimeVisualizer();
+        this.stopLyricsLoop();
         this.detachEvents(this._currentAudioEl);
         if (this.isLocalAudio && this.localAudio) this.localAudio.pause();
         if (this.resizeObserver) { this.resizeObserver.disconnect(); this.resizeObserver = null; }
         const m = document.getElementById("vg-modal"); m.classList.remove("active");
+        document.body.classList.remove("vg-open");
         setTimeout(() => { m.style.display = "none"; this.reset(); }, 500);
       },
 
       reset: function () {
+        this.stopLyricsLoop();
         document.getElementById("vg-status-loading").style.display = "none";
         document.getElementById("vg-status-success").style.display = "none";
         document.getElementById("vg-ui-container").classList.remove("vg-rendering-hide");
@@ -602,36 +1320,54 @@
 
       parseAndSetLyrics: function (text) {
         const box = document.getElementById("vg-lyrics"); box.innerHTML = "";
-        this.lyricTimes = []; this.lyricRaw = [];
-        const lines = text.split("\n"), re = /\[(\d{2}):(\d{2})\.(\d{2,3})\]/;
-        
-        lines.forEach(line => {
-            const m = line.match(re), c = line.replace(/\[.*?\]/g, "").trim();
-            if (m && c) {
-                const t = parseInt(m[1]) * 60 + parseInt(m[2]) + parseInt(m[3]) / (m[3].length === 2 ? 100 : 1000);
-                this.lyricTimes.push({ time: t, content: c }); this.lyricRaw.push({ time: t, text: c });
-                const d = document.createElement("div"); d.className = "vg-line"; d.textContent = c;
-                d.onclick = () => { 
-                    if (this.isLocalAudio) {
-                        this.localAudio.currentTime = t;
-                        if (this.localAudio.paused) this.localAudio.play();
+        this.lyricTimes = []; this.lyricRaw = []; this.lyricGroups = []; this.lyricMode = 'line'; this.lastActiveIndex = -1;
+
+        const parsed = parseLyrics(text);
+        this.lyricGroups = parsed.groups;
+        this.lyricMode = parsed.type;
+
+        parsed.groups.forEach((group, index) => {
+            const { orig, roma, trans } = splitLyricGroupLines(group.lines);
+            if (!orig) return;
+
+            const t = group.time;
+            this.lyricTimes.push({ time: t, content: orig.text });
+            this.lyricRaw.push({ time: t, text: orig.text });
+
+            const d = document.createElement("div");
+            d.className = parsed.type === 'karaoke' ? "vg-line vg-line-karaoke" : "vg-line";
+            d.dataset.index = String(index);
+
+            if (parsed.type === 'karaoke') {
+                d.innerHTML = [
+                    renderKaraokeLineHTML(orig, 'vg-line-orig', group, true),
+                    renderKaraokeLineHTML(roma, 'vg-line-roma', group, !!roma?.verbatim),
+                    renderKaraokeLineHTML(trans, 'vg-line-trans', group, !!trans?.verbatim)
+                ].join('');
+            } else {
+                d.textContent = orig.text;
+            }
+
+            d.onclick = () => { 
+                if (this.isLocalAudio) {
+                    this.localAudio.currentTime = t;
+                    if (this.localAudio.paused) this.localAudio.play();
+                } else {
+                    if (window.currentPlayingId === this.data.id) {
+                        if (window.ap && window.ap.audio) { window.ap.seek(t); if (window.ap.audio.paused) window.ap.play(); }
                     } else {
-                        if (window.currentPlayingId === this.data.id) {
-                            if (window.ap && window.ap.audio) { window.ap.seek(t); if (window.ap.audio.paused) window.ap.play(); }
-                        } else {
-                            if (typeof window.playAllAndJumpToId === 'function') {
-                                window.playAllAndJumpToId(this.data.id);
-                                const onCanPlay = () => {
-                                    if (window.ap && window.ap.audio) window.ap.seek(t);
-                                    window.ap.audio.removeEventListener('canplay', onCanPlay);
-                                };
-                                window.ap.audio.addEventListener('canplay', onCanPlay);
-                            }
+                        if (typeof window.playAllAndJumpToId === 'function') {
+                            window.playAllAndJumpToId(this.data.id);
+                            const onCanPlay = () => {
+                                if (window.ap && window.ap.audio) window.ap.seek(t);
+                                window.ap.audio.removeEventListener('canplay', onCanPlay);
+                            };
+                            window.ap.audio.addEventListener('canplay', onCanPlay);
                         }
                     }
-                };
-                box.appendChild(d);
-            }
+                }
+            };
+            box.appendChild(d);
         });
         if (this.lyricTimes.length === 0) box.innerHTML = '<p style="padding-top:100px; color:rgba(255,255,255,0.5);">纯音乐 / 无歌词</p>';
       },
@@ -685,6 +1421,22 @@
           animate();
       },
       stopRealtimeVisualizer: function() { if (this.animationId) cancelAnimationFrame(this.animationId); },
+      startLyricsLoop: function() {
+          if (this.lyricsAnimationId) return;
+          const tick = () => {
+              this.lyricsAnimationId = null;
+              this.syncLyrics();
+              if (!this.isPlaying) return;
+              this.lyricsAnimationId = requestAnimationFrame(tick);
+          };
+          this.lyricsAnimationId = requestAnimationFrame(tick);
+      },
+      stopLyricsLoop: function() {
+          if (this.lyricsAnimationId) {
+              cancelAnimationFrame(this.lyricsAnimationId);
+              this.lyricsAnimationId = null;
+          }
+      },
   
       startRendering: function () {
         if (!this.data) return;
@@ -697,7 +1449,9 @@
             artist: this.data.artist,
             rawCover: this.customVisual || this.data.cover || "https://via.placeholder.com/600",
             isVideoBg: this.isVideoBg,
-            lyricRaw: this.lyricRaw, 
+            lyricRaw: this.lyricRaw,
+            lyricGroups: this.lyricGroups,
+            lyricMode: this.lyricMode,
             customAudioFile: this.isLocalAudio ? this._currentLocalAudioFile : null,
             apiRoot: window.API_ROOT
         };
@@ -756,10 +1510,27 @@
         
         if (this.lyricTimes.length === 0 || this.isUserScrolling) return;
         let active = -1; for (let i = 0; i < this.lyricTimes.length; i++) { if (ct >= this.lyricTimes[i].time) active = i; else break; }
-        if (active !== -1 && active !== this.lastActiveIndex) {
-          const ls = document.querySelectorAll(".vg-line"); ls.forEach(l => l.classList.remove("active"));
+        if (active === -1) return;
+
+        const ls = document.querySelectorAll(".vg-line");
+        if (active !== this.lastActiveIndex) {
+          ls.forEach(l => {
+            l.classList.remove("active");
+          });
           const al = ls[active]; if (al) { al.classList.add("active"); if (!this.isUserScrolling) al.scrollIntoView({ behavior: "smooth", block: "center" }); }
           this.lastActiveIndex = active;
+        }
+
+        if (this.lyricMode === 'karaoke') {
+          const ms = ct * 1000;
+          document.querySelectorAll(".vg-word").forEach(word => {
+            const start = Number(word.dataset.start || 0);
+            const end = Number(word.dataset.end || start + fallbackLineDuration);
+            const progress = lyricProgress(ms, start, end);
+            // 核心修复：100% 进度时直接加上安全距离，防止被裁切掉右侧描边
+            word.style.setProperty("--karaoke-progress", progress === 1 ? "calc(100% + 8px)" : `${(progress * 100).toFixed(3)}%`);
+            word.classList.toggle("is-active", progress > 0 && progress < 1);
+          });
         }
       },
     };

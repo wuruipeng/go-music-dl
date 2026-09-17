@@ -1,4 +1,4 @@
-// Package main generates winres.json for go-music-dl
+// Package main generates Windows resource manifests.
 package main
 
 import (
@@ -9,9 +9,9 @@ import (
 	"time"
 )
 
-const js = `{
+const resourceTemplate = `{
   "RT_GROUP_ICON": {
-    "APP": {
+    "#2": {
       "0000": [
         "icon_256x256.png"
       ]
@@ -21,10 +21,10 @@ const js = `{
     "#1": {
       "0409": {
         "identity": {
-          "name": "go-music-dl",
+          "name": "%s",
           "version": "%s"
         },
-        "description": "Go Music DL - 一个完整的、工程化的 Go 音乐下载项目",
+        "description": "Go Music DL desktop application",
         "minimum-os": "vista",
         "execution-level": "as invoker",
         "ui-access": false,
@@ -56,10 +56,10 @@ const js = `{
             "CompanyName": "guohuiyuan",
             "FileDescription": "https://github.com/guohuiyuan/go-music-dl",
             "FileVersion": "%s",
-            "InternalName": "music-dl",
+            "InternalName": "%s",
             "LegalCopyright": "%s",
             "LegalTrademarks": "",
-            "OriginalFilename": "MUSIC-DL.EXE",
+            "OriginalFilename": "%s",
             "PrivateBuild": "",
             "ProductName": "Go Music DL",
             "ProductVersion": "%s",
@@ -71,37 +71,85 @@ const js = `{
   }
 }`
 
-const timeformat = `2006-01-02T15:04:05+08:00`
+const timeFormat = "2006-01-02T15:04:05+08:00"
+
+type resourceSpec struct {
+	outputFile       string
+	identityName     string
+	internalName     string
+	originalFileName string
+}
 
 func main() {
-	f, err := os.Create("winres.json")
+	fileVersion := resolveFileVersion()
+	productVersion := "v1.0.0"
+	timestamp := time.Now().Format(timeFormat)
+	copyright := "(c) 2026 guohuiyuan. All Rights Reserved."
+
+	specs := []resourceSpec{
+		{
+			outputFile:       "winres.json",
+			identityName:     "go-music-dl-desktop",
+			internalName:     "go-music-dl-desktop",
+			originalFileName: "go-music-dl-desktop.exe",
+		},
+		{
+			outputFile:       "desktop_go.winres.json",
+			identityName:     "music-dl-desktop-go",
+			internalName:     "music-dl-desktop-go",
+			originalFileName: "music-dl-desktop-go.exe",
+		},
+	}
+
+	for _, spec := range specs {
+		if err := writeResourceFile(spec, fileVersion, productVersion, timestamp, copyright); err != nil {
+			panic(err)
+		}
+	}
+}
+
+func resolveFileVersion() string {
+	var stdout strings.Builder
+	cmd := exec.Command("git", "rev-list", "--count", "HEAD")
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		return "1.0.0.0"
+	}
+
+	commitCount := strings.TrimSpace(stdout.String())
+	if commitCount == "" {
+		return "1.0.0.0"
+	}
+
+	return "1.0.0." + commitCount
+}
+
+func writeResourceFile(
+	spec resourceSpec,
+	fileVersion string,
+	productVersion string,
+	timestamp string,
+	copyright string,
+) error {
+	f, err := os.Create(spec.outputFile)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	defer f.Close()
 
-	// 获取版本信息
-	version := "v1.0.0"
-
-	// 获取 git 提交计数
-	commitcnt := strings.Builder{}
-	commitcntcmd := exec.Command("git", "rev-list", "--count", "HEAD")
-	commitcntcmd.Stdout = &commitcnt
-	err = commitcntcmd.Run()
-
-	var fv string
-	if err != nil {
-		// 如果 git 命令失败，使用默认版本
-		fv = "1.0.0.0"
-	} else {
-		commitCount := strings.TrimSpace(commitcnt.String())
-		fv = "1.0.0." + commitCount
-	}
-
-	copyright := "© 2026 guohuiyuan. All Rights Reserved."
-
-	_, err = fmt.Fprintf(f, js, fv, fv, version, time.Now().Format(timeformat), fv, copyright, version)
-	if err != nil {
-		panic(err)
-	}
+	_, err = fmt.Fprintf(
+		f,
+		resourceTemplate,
+		spec.identityName,
+		fileVersion,
+		fileVersion,
+		productVersion,
+		timestamp,
+		fileVersion,
+		spec.internalName,
+		copyright,
+		spec.originalFileName,
+		productVersion,
+	)
+	return err
 }

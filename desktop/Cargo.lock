@@ -1017,17 +1017,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "go-music-dl-desktop"
-version = "0.1.0"
-dependencies = [
- "image",
- "open",
- "tao",
- "winres",
- "wry",
-]
-
-[[package]]
 name = "gobject-sys"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1556,6 +1545,17 @@ checksum = "ac9557c559cd6fc9867e122e20d2cbefc9ca29d80d027a8e39310920ed2f0a97"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "music-dl-desktop-rust"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "open",
+ "tao",
+ "winres",
+ "wry",
 ]
 
 [[package]]
